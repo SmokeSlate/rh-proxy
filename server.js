@@ -2,6 +2,7 @@
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const { ProxyAgent } = require('undici');
 const { addExtra } = require('puppeteer-extra');
 const puppeteerCore = require('puppeteer-core');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -13,7 +14,7 @@ const app = express();
 app.disable('x-powered-by');
 
 const HOST = process.env.HOST || '0.0.0.0';
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = toPort(process.env.PORT, 3000);
 const BASE_API = withTrailingSlash(
   process.env.ROUTINEHUB_API_BASE || 'https://routinehub.co/api/v1/'
 );
@@ -23,10 +24,13 @@ const MAX_CACHE_ENTRIES = toPositiveInt(process.env.MAX_CACHE_ENTRIES, 100);
 const MAX_BROWSER_PAGES = toPositiveInt(process.env.MAX_BROWSER_PAGES, 2);
 const RATE_LIMIT_MAX = toPositiveInt(process.env.RATE_LIMIT_MAX, 60);
 const DIRECT_FETCH_FIRST = process.env.DIRECT_FETCH_FIRST !== 'false';
+const OUTBOUND_PROXY_URL = process.env.OUTBOUND_PROXY_URL || '';
 const CHROME_PATH =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   process.env.CHROME_BIN ||
   '/usr/bin/chromium';
+const FETCH_DISPATCHER = createFetchDispatcher(OUTBOUND_PROXY_URL);
+const BROWSER_PROXY = parseBrowserProxy(OUTBOUND_PROXY_URL);
 
 const USER_AGENT =
   process.env.USER_AGENT ||
@@ -83,12 +87,41 @@ app.use(async (req, res) => {
   } catch (err) {
     console.error('Proxy error:', err);
     await resetBrowser();
-    res.status(502).json({ error: 'Unable to fetch RoutineHub data' });
+    res.status(err.statusCode || 502).json({
+      error: err.publicMessage || 'Unable to fetch RoutineHub data',
+      code: err.code || 'UPSTREAM_FETCH_FAILED',
+      detail: err.publicDetail,
+    });
   }
 });
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`Proxy listening on http://${HOST}:${PORT}`);
+  console.log(
+    JSON.stringify({
+      event: 'server_listening',
+      host: HOST,
+      port: PORT,
+      portEnv: process.env.PORT || null,
+      chromePath: CHROME_PATH,
+      outboundProxy: maskProxyUrl(OUTBOUND_PROXY_URL),
+      nodeEnv: process.env.NODE_ENV || null,
+      nodeVersion: process.version,
+    })
+  );
+});
+
+server.on('error', (err) => {
+  console.error('Server failed to start:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  process.exit(1);
 });
 
 for (const signal of ['SIGTERM', 'SIGINT']) {
@@ -117,16 +150,24 @@ async function fetchDirect(url) {
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch(url, {
+    const fetchOptions = {
       headers: {
         Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
         'User-Agent': USER_AGENT,
       },
       signal: controller.signal,
-    });
+    };
+
+    if (FETCH_DISPATCHER) {
+      fetchOptions.dispatcher = FETCH_DISPATCHER;
+    }
+
+    const response = await fetch(url, fetchOptions);
 
     const bodyContent = await response.text();
     const contentType = response.headers.get('content-type') || '';
+
+    assertNotCloudflareBlocked(bodyContent, 'direct');
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
@@ -155,6 +196,10 @@ async function fetchWithBrowser(url) {
     page.setDefaultTimeout(REQUEST_TIMEOUT_MS);
 
     await page.setUserAgent(USER_AGENT);
+    if (BROWSER_PROXY && BROWSER_PROXY.auth) {
+      await page.authenticate(BROWSER_PROXY.auth);
+    }
+
     await page.setRequestInterception(true);
     page.on('request', (request) => {
       if (['font', 'image', 'media', 'stylesheet'].includes(request.resourceType())) {
@@ -183,6 +228,8 @@ async function fetchWithBrowser(url) {
         ? document.body.textContent.trim()
         : '')
     );
+
+    assertNotCloudflareBlocked(`${bodyContent}\n${content}`, 'browser');
 
     return {
       bodyContent,
@@ -216,6 +263,7 @@ async function initBrowser() {
           '--mute-audio',
           '--no-default-browser-check',
           '--no-first-run',
+          ...(BROWSER_PROXY ? [`--proxy-server=${BROWSER_PROXY.server}`] : []),
         ],
       })
       .then((launchedBrowser) => {
@@ -362,4 +410,71 @@ function toPositiveInt(value, fallback) {
 function toNonNegativeInt(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function toPort(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
+    ? parsed
+    : fallback;
+}
+
+function createFetchDispatcher(proxyUrl) {
+  if (!proxyUrl) {
+    return undefined;
+  }
+
+  return new ProxyAgent(proxyUrl);
+}
+
+function parseBrowserProxy(proxyUrl) {
+  if (!proxyUrl) {
+    return null;
+  }
+
+  const parsed = new URL(proxyUrl);
+  return {
+    server: `${parsed.protocol}//${parsed.host}`,
+    auth: parsed.username
+      ? {
+          username: decodeURIComponent(parsed.username),
+          password: decodeURIComponent(parsed.password),
+        }
+      : null,
+  };
+}
+
+function assertNotCloudflareBlocked(text, source) {
+  const normalized = text.toLowerCase();
+  const isAsnBlocked =
+    normalized.includes('error 1005') ||
+    (normalized.includes('autonomous system number') &&
+      normalized.includes('banned'));
+
+  if (!isAsnBlocked) {
+    return;
+  }
+
+  const err = new Error(`RoutineHub blocked the ${source} request by ASN/IP`);
+  err.name = 'UpstreamBlockedError';
+  err.code = 'UPSTREAM_ASN_BLOCKED';
+  err.statusCode = 502;
+  err.publicMessage = 'RoutineHub blocked this deployment IP/ASN';
+  err.publicDetail =
+    'Railway egress is being blocked by RoutineHub/Cloudflare. Use OUTBOUND_PROXY_URL with a non-blocked proxy, deploy on a different provider/IP, or ask RoutineHub to whitelist the Railway ASN.';
+  throw err;
+}
+
+function maskProxyUrl(proxyUrl) {
+  if (!proxyUrl) {
+    return null;
+  }
+
+  const parsed = new URL(proxyUrl);
+  if (parsed.username) {
+    parsed.username = '***';
+    parsed.password = parsed.password ? '***' : '';
+  }
+
+  return parsed.toString();
 }
