@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 
@@ -7,12 +5,13 @@ ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM node:22-bookworm-slim
 WORKDIR /app
 
 ENV NODE_ENV=production \
+    DEBIAN_FRONTEND=noninteractive \
     HOST=0.0.0.0 \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
