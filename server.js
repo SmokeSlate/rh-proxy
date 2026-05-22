@@ -1019,7 +1019,7 @@ function assertNotCloudflareBlocked(text, source) {
   err.statusCode = 502;
   err.publicMessage = 'RoutineHub blocked this deployment IP/ASN';
   err.publicDetail =
-    'Railway egress is being blocked by RoutineHub/Cloudflare. Use OUTBOUND_PROXY_URL with a non-blocked proxy, deploy on a different provider/IP, or ask RoutineHub to whitelist the Railway ASN.';
+    'This host egress IP/ASN is being blocked by RoutineHub/Cloudflare. Use OUTBOUND_PROXY_URL with a non-blocked proxy, deploy on a different provider/IP, or ask RoutineHub to whitelist this host.';
   throw err;
 }
 
