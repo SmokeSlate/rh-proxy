@@ -228,6 +228,10 @@ async function fetchRoutineHub(url) {
           stats.directFetches += 1;
           return await fetchDirect(url);
         } catch (err) {
+          if (err.code === 'PROXY_SELECTION_FAILED') {
+            throw err;
+          }
+
           if (AUTO_PROXY_ENABLED && shouldRotateProxy(err)) {
             throw err;
           }
