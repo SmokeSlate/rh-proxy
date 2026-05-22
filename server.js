@@ -14,6 +14,7 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', process.env.TRUST_PROXY || 'loopback');
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = toPort(process.env.PORT, 80);
