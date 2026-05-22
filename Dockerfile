@@ -30,5 +30,5 @@ COPY server.js ./
 
 USER pptruser
 
-EXPOSE 8080
+EXPOSE 80
 CMD ["node", "server.js"]

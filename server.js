@@ -14,7 +14,7 @@ const app = express();
 app.disable('x-powered-by');
 
 const HOST = process.env.HOST || '0.0.0.0';
-const PORT = toPort(process.env.PORT, 8080);
+const PORT = toPort(process.env.PORT, 80);
 const MANAGE_HOST = process.env.MANAGE_HOST || '0.0.0.0';
 const MANAGE_PORT = toPort(process.env.MANAGE_PORT, 9999);
 const MANAGE_ENABLED = process.env.MANAGE_ENABLED !== 'false';

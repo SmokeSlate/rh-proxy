@@ -16,7 +16,7 @@ Useful overrides:
 sudo env \
   REPO_URL=https://github.com/SmokeSlate/rh-proxy.git \
   BRANCH=main \
-  PROXY_PORT=8080 \
+  PROXY_PORT=80 \
   MANAGE_PORT=9999 \
   UPDATE_INTERVAL=5min \
   bash scripts/deploy-gcp.sh
@@ -30,7 +30,7 @@ Management UI:
 http://<instance-ip>:9999/?token=<printed-token>
 ```
 
-If the ports are not reachable externally, open GCP firewall TCP ports `8080` and `9999`.
+If the ports are not reachable externally, open GCP firewall TCP ports `80` and `9999`.
 
 ## Runtime settings
 
@@ -94,11 +94,11 @@ npm run check
 npm start
 ```
 
-The local server defaults to `http://localhost:8080`.
+The local server defaults to `http://localhost`.
 
 For full proxy testing with plain `npm start`, set `PUPPETEER_EXECUTABLE_PATH` to a local Chrome or Chromium executable.
 
 ```sh
 docker build -t routinehub-proxy .
-docker run --rm -p 8080:8080 routinehub-proxy
+docker run --rm -p 80:80 routinehub-proxy
 ```
