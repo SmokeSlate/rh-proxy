@@ -185,6 +185,8 @@ install_repo() {
     useradd --system --home-dir "${APP_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
   fi
 
+  git config --global --add safe.directory "${APP_DIR}" >/dev/null 2>&1 || true
+
   if [[ -d "${APP_DIR}/.git" ]]; then
     log "Updating existing checkout"
     git -C "${APP_DIR}" fetch --depth 1 origin "${BRANCH}"
@@ -252,6 +254,7 @@ exec 9>/run/\${APP_NAME}-update.lock
 flock -n 9 || exit 0
 
 cd "\${APP_DIR}"
+git config --global --add safe.directory "\${APP_DIR}" >/dev/null 2>&1 || true
 current="\$(git rev-parse HEAD)"
 git fetch --quiet --depth 1 origin "\${BRANCH}"
 latest="\$(git rev-parse "origin/\${BRANCH}")"
