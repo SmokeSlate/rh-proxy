@@ -16,6 +16,7 @@ MEMORY_MAX="${MEMORY_MAX:-768M}"
 SWAP_FILE="${SWAP_FILE:-/swapfile}"
 SWAP_SIZE_MB="${SWAP_SIZE_MB:-1024}"
 MIN_MEMORY_WITHOUT_SWAP_MB="${MIN_MEMORY_WITHOUT_SWAP_MB:-1400}"
+DEFAULT_PROXY_LIST_URL="https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=http&country=af%2Cal%2Cdz%2Cad%2Cao%2Car%2Cam%2Cau%2Cat%2Caz%2Cbd%2Cby%2Cbe%2Cbj%2Cbm%2Cbt%2Cbo%2Cbw%2Cbg%2Cbf%2Cbi%2Ckh%2Ccm%2Cca%2Ctd%2Ccl%2Ccn%2Cco%2Ccg%2Ccr%2Chr%2Ccy%2Ccz%2Cdk%2Cdo%2Cec%2Ceg%2Csv%2Cgq%2Cee%2Csz%2Cet%2Cfj%2Cfi%2Cfr%2Cgm%2Cge%2Cde%2Cgh%2Cgi%2Cgr%2Cgu%2Cgt%2Cgn%2Cht%2Chn%2Chk%2Chu%2Cin%2Cid%2Cir%2Ciq%2Cie%2Cil%2Cit%2Cjm%2Cjp%2Cjo%2Ckz%2Cke%2Ckr%2Ckg%2Clv%2Clb%2Cls%2Clt%2Cmg%2Cmw%2Cmy%2Cmv%2Cml%2Cmt%2Cmu%2Cmx%2Cmd%2Cmn%2Cme%2Cma%2Cmz%2Cmm%2Cna%2Cnp%2Cnl%2Cnz%2Cni%2Cng%2Cmk%2Cno%2Cpk%2Cps%2Cpa%2Cpy%2Cpe%2Cph%2Cpl%2Cpt%2Cpr%2Cqa%2Cro%2Crw%2Ckn%2Csa%2Csn%2Crs%2Csc%2Csl%2Csg%2Csk%2Csi%2Cso%2Cza%2Ces%2Clk%2Csd%2Cse%2Cch%2Csy%2Ctw%2Ctj%2Ctz%2Cth%2Ctl%2Ctg%2Ctn%2Ctr%2Cug%2Cua%2Cae%2Cgb%2Cus%2Cuy%2Cuz%2Cve%2Cvn%2Cvi%2Cye%2Czw&timeout=251"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this script as root, for example: sudo bash scripts/deploy-gcp.sh" >&2
@@ -157,6 +158,13 @@ write_env_file() {
   if [[ -z "${outbound_proxy}" ]]; then
     outbound_proxy="$(read_env_value OUTBOUND_PROXY_URL "${ENV_FILE}" || true)"
   fi
+  local proxy_list_url="${PROXY_LIST_URL:-}"
+  if [[ -z "${proxy_list_url}" ]]; then
+    proxy_list_url="$(read_env_value PROXY_LIST_URL "${ENV_FILE}" || true)"
+  fi
+  if [[ -z "${proxy_list_url}" ]]; then
+    proxy_list_url="${DEFAULT_PROXY_LIST_URL}"
+  fi
 
   cat >"${ENV_FILE}" <<EOF_ENV
 NODE_ENV=production
@@ -175,6 +183,14 @@ REQUEST_TIMEOUT_MS=30000
 RATE_LIMIT_MAX=120
 DIRECT_FETCH_FIRST=true
 OUTBOUND_PROXY_URL=${outbound_proxy}
+PROXY_LIST_URL=${proxy_list_url}
+AUTO_PROXY_ENABLED=${AUTO_PROXY_ENABLED:-true}
+PROXY_LIST_REFRESH_MS=${PROXY_LIST_REFRESH_MS:-600000}
+PROXY_TEST_TIMEOUT_MS=${PROXY_TEST_TIMEOUT_MS:-5000}
+PROXY_TEST_CANDIDATES=${PROXY_TEST_CANDIDATES:-40}
+PROXY_TEST_CONCURRENCY=${PROXY_TEST_CONCURRENCY:-4}
+PROXY_BAD_TTL_MS=${PROXY_BAD_TTL_MS:-1800000}
+PROXY_RETRY_LIMIT=${PROXY_RETRY_LIMIT:-6}
 EOF_ENV
   chmod 0600 "${ENV_FILE}"
 }

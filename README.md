@@ -46,6 +46,11 @@ These environment variables are optional:
 | `RATE_LIMIT_MAX` | `60` | Requests per minute per IP. |
 | `DIRECT_FETCH_FIRST` | `true` | Try a cheap HTTP fetch before launching Chromium. Set `false` to always use Chromium. |
 | `OUTBOUND_PROXY_URL` | unset | Optional HTTP/SOCKS proxy used for requests to RoutineHub. Useful when a host ASN is blocked by RoutineHub/Cloudflare. |
+| `PROXY_LIST_URL` | ProxyScrape URL in deploy script | Text list of `http://ip:port` proxies to sample when no fixed proxy is configured. |
+| `AUTO_PROXY_ENABLED` | `true` in deploy script | Enables random working proxy selection from `PROXY_LIST_URL`. |
+| `PROXY_TEST_CANDIDATES` | `40` in deploy script | Max randomly sampled proxies tested per selection cycle. |
+| `PROXY_TEST_CONCURRENCY` | `4` | Number of proxy tests run at once. |
+| `PROXY_RETRY_LIMIT` | `6` | Max proxy rotations attempted for one request. |
 | `MANAGE_ENABLED` | `true` in deploy script | Enables the management UI. |
 | `MANAGE_HOST` | `0.0.0.0` in deploy script | Management UI bind address. |
 | `MANAGE_PORT` | `9999` | Management UI port. |
@@ -76,7 +81,8 @@ sudo systemctl disable --now rh-proxy-update.timer
 
 If `/health` works but proxy routes show Cloudflare error `1005`, the app is reachable but RoutineHub is blocking the host's outbound ASN/IP. The app cannot fix that from the same blocked egress IP. Use one of these options:
 
-- Set `OUTBOUND_PROXY_URL` to a non-blocked proxy URL, for example `http://user:pass@host:port`.
+- Let the deploy script use `PROXY_LIST_URL` to sample random HTTP proxies until one can reach RoutineHub.
+- Set `OUTBOUND_PROXY_URL` to a known non-blocked proxy URL, for example `http://user:pass@host:port`.
 - Deploy on a provider/IP that RoutineHub does not block.
 - Ask RoutineHub to whitelist the deployment ASN/IP.
 

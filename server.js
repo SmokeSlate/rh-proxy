@@ -29,12 +29,37 @@ const MAX_BROWSER_PAGES = toPositiveInt(process.env.MAX_BROWSER_PAGES, 2);
 const RATE_LIMIT_MAX = toPositiveInt(process.env.RATE_LIMIT_MAX, 60);
 const DIRECT_FETCH_FIRST = process.env.DIRECT_FETCH_FIRST !== 'false';
 const OUTBOUND_PROXY_URL = process.env.OUTBOUND_PROXY_URL || '';
+const PROXY_LIST_URL = process.env.PROXY_LIST_URL || '';
+const AUTO_PROXY_ENABLED =
+  process.env.AUTO_PROXY_ENABLED !== 'false' && Boolean(PROXY_LIST_URL);
+const PROXY_LIST_REFRESH_MS = toPositiveInt(
+  process.env.PROXY_LIST_REFRESH_MS,
+  10 * 60 * 1000
+);
+const PROXY_TEST_TIMEOUT_MS = toPositiveInt(
+  process.env.PROXY_TEST_TIMEOUT_MS,
+  5000
+);
+const PROXY_TEST_CANDIDATES = toPositiveInt(
+  process.env.PROXY_TEST_CANDIDATES,
+  32
+);
+const PROXY_TEST_CONCURRENCY = toPositiveInt(
+  process.env.PROXY_TEST_CONCURRENCY,
+  4
+);
+const PROXY_BAD_TTL_MS = toPositiveInt(
+  process.env.PROXY_BAD_TTL_MS,
+  30 * 60 * 1000
+);
+const PROXY_RETRY_LIMIT = toPositiveInt(process.env.PROXY_RETRY_LIMIT, 5);
+const PROXY_TEST_URL =
+  process.env.PROXY_TEST_URL ||
+  new URL('shortcuts/6565/versions/latest', BASE_API).toString();
 const CHROME_PATH =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   process.env.CHROME_BIN ||
   '/usr/bin/chromium';
-const FETCH_DISPATCHER = createFetchDispatcher(OUTBOUND_PROXY_URL);
-const BROWSER_PROXY = parseBrowserProxy(OUTBOUND_PROXY_URL);
 
 const USER_AGENT =
   process.env.USER_AGENT ||
@@ -43,9 +68,26 @@ const USER_AGENT =
 
 let browser;
 let browserPromise;
+let browserProxyUrl = '';
 let activeBrowserPages = 0;
 const browserQueue = [];
 const responseCache = new Map();
+const fetchDispatchers = new Map();
+const proxyState = {
+  list: [],
+  fetchedAt: 0,
+  refreshPromise: null,
+  selectPromise: null,
+  selectedUrl: OUTBOUND_PROXY_URL,
+  selectedAt: OUTBOUND_PROXY_URL ? new Date() : null,
+  badUntil: new Map(),
+  lastError: null,
+  lastTestAt: null,
+  tested: 0,
+  working: 0,
+  failed: 0,
+  rotations: 0,
+};
 const stats = {
   startedAt: new Date(),
   proxyRequests: 0,
@@ -123,7 +165,9 @@ const server = app.listen(PORT, HOST, () => {
       port: PORT,
       portEnv: process.env.PORT || null,
       chromePath: CHROME_PATH,
-      outboundProxy: maskProxyUrl(OUTBOUND_PROXY_URL),
+      outboundProxy: maskProxyUrl(proxyState.selectedUrl),
+      autoProxyEnabled: AUTO_PROXY_ENABLED,
+      proxyListUrl: PROXY_LIST_URL ? 'configured' : null,
       nodeEnv: process.env.NODE_ENV || null,
       nodeVersion: process.version,
     })
@@ -174,17 +218,40 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 }
 
 async function fetchRoutineHub(url) {
-  if (DIRECT_FETCH_FIRST) {
+  let lastErr;
+  const maxAttempts = AUTO_PROXY_ENABLED ? PROXY_RETRY_LIMIT : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      stats.directFetches += 1;
-      return await fetchDirect(url);
+      if (DIRECT_FETCH_FIRST) {
+        try {
+          stats.directFetches += 1;
+          return await fetchDirect(url);
+        } catch (err) {
+          if (AUTO_PROXY_ENABLED && shouldRotateProxy(err)) {
+            throw err;
+          }
+          console.warn(`Direct fetch failed, falling back to browser: ${err.message}`);
+        }
+      }
+
+      stats.browserFetches += 1;
+      return await withBrowserSlot(() => fetchWithBrowser(url));
     } catch (err) {
-      console.warn(`Direct fetch failed, falling back to browser: ${err.message}`);
+      lastErr = err;
+
+      if (!AUTO_PROXY_ENABLED || !shouldRotateProxy(err) || attempt >= maxAttempts) {
+        throw err;
+      }
+
+      console.warn(
+        `Proxy attempt ${attempt} failed, rotating proxy: ${err.message}`
+      );
+      await rotateActiveProxy(err);
     }
   }
 
-  stats.browserFetches += 1;
-  return withBrowserSlot(() => fetchWithBrowser(url));
+  throw lastErr;
 }
 
 async function fetchDirect(url) {
@@ -192,6 +259,7 @@ async function fetchDirect(url) {
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
+    const proxyUrl = await getActiveProxyUrl();
     const fetchOptions = {
       headers: {
         Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
@@ -200,8 +268,8 @@ async function fetchDirect(url) {
       signal: controller.signal,
     };
 
-    if (FETCH_DISPATCHER) {
-      fetchOptions.dispatcher = FETCH_DISPATCHER;
+    if (proxyUrl) {
+      fetchOptions.dispatcher = getFetchDispatcher(proxyUrl);
     }
 
     const response = await fetch(url, fetchOptions);
@@ -230,7 +298,9 @@ async function fetchDirect(url) {
 }
 
 async function fetchWithBrowser(url) {
-  const b = await initBrowser();
+  const proxyUrl = await getActiveProxyUrl();
+  const browserProxy = parseBrowserProxy(proxyUrl);
+  const b = await initBrowser(proxyUrl);
   const page = await b.newPage();
 
   try {
@@ -238,8 +308,8 @@ async function fetchWithBrowser(url) {
     page.setDefaultTimeout(REQUEST_TIMEOUT_MS);
 
     await page.setUserAgent(USER_AGENT);
-    if (BROWSER_PROXY && BROWSER_PROXY.auth) {
-      await page.authenticate(BROWSER_PROXY.auth);
+    if (browserProxy && browserProxy.auth) {
+      await page.authenticate(browserProxy.auth);
     }
 
     await page.setRequestInterception(true);
@@ -283,13 +353,20 @@ async function fetchWithBrowser(url) {
   }
 }
 
-async function initBrowser() {
-  if (browser && browser.connected) {
+async function initBrowser(proxyUrl = '') {
+  if (browser && browser.connected && browserProxyUrl === proxyUrl) {
     return browser;
   }
 
+  if (browser && browser.connected && browserProxyUrl !== proxyUrl) {
+    await resetBrowser();
+  }
+
   if (!browserPromise) {
-    console.log('Launching Chromium...');
+    const browserProxy = parseBrowserProxy(proxyUrl);
+    console.log(
+      `Launching Chromium${browserProxy ? ` with proxy ${maskProxyUrl(proxyUrl)}` : ''}...`
+    );
     browserPromise = puppeteer
       .launch({
         executablePath: CHROME_PATH,
@@ -305,14 +382,16 @@ async function initBrowser() {
           '--mute-audio',
           '--no-default-browser-check',
           '--no-first-run',
-          ...(BROWSER_PROXY ? [`--proxy-server=${BROWSER_PROXY.server}`] : []),
+          ...(browserProxy ? [`--proxy-server=${browserProxy.server}`] : []),
         ],
       })
       .then((launchedBrowser) => {
         browser = launchedBrowser;
+        browserProxyUrl = proxyUrl;
         browserPromise = null;
         browser.on('disconnected', () => {
           browser = null;
+          browserProxyUrl = '';
         });
         return launchedBrowser;
       })
@@ -358,6 +437,7 @@ async function resetBrowser() {
 
   const oldBrowser = browser;
   browser = null;
+  browserProxyUrl = '';
   await oldBrowser.close().catch(() => {});
 }
 
@@ -444,6 +524,15 @@ function createManageApp() {
     res.json({ ok: true });
   });
 
+  manageApp.post('/api/proxy/rotate', requireManageAuth, async (_req, res) => {
+    await rotateActiveProxy(new Error('Manual proxy rotation'));
+    res.json({
+      ok: true,
+      selectedProxy: maskProxyUrl(proxyState.selectedUrl),
+      proxy: getProxyStatus(),
+    });
+  });
+
   manageApp.post('/api/test', requireManageAuth, async (req, res) => {
     const path = String(req.body.path || req.query.path || 'shortcuts/6565/versions/latest');
     const startedAt = Date.now();
@@ -520,7 +609,10 @@ function getManageStatus() {
       outboundProxy: maskProxyUrl(OUTBOUND_PROXY_URL),
       directFetchFirst: DIRECT_FETCH_FIRST,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
+      autoProxyEnabled: AUTO_PROXY_ENABLED,
+      selectedProxy: maskProxyUrl(proxyState.selectedUrl),
     },
+    proxyPool: getProxyStatus(),
     management: {
       enabled: MANAGE_ENABLED,
       host: MANAGE_HOST,
@@ -630,6 +722,7 @@ function renderManagePage() {
       <div class="row">
         <button id="clear-cache" type="button">Clear Cache</button>
         <button id="restart-browser" type="button">Restart Chromium</button>
+        <button id="rotate-proxy" type="button">Rotate Proxy</button>
       </div>
     </section>
 
@@ -809,7 +902,8 @@ function manageScript() {
         ['Proxy', status.proxy.host + ':' + status.proxy.port],
         ['Manage', status.management.host + ':' + status.management.port],
         ['Base API', status.proxy.baseApi],
-        ['Proxy URL', status.proxy.outboundProxy || 'none'],
+        ['Proxy URL', status.proxy.selectedProxy || status.proxy.outboundProxy || 'none'],
+        ['Auto proxy', status.proxy.autoProxyEnabled],
         ['Node', status.nodeVersion],
       ]);
       entries(fields.traffic, [
@@ -818,6 +912,7 @@ function manageScript() {
         ['Cache hits', status.stats.cacheHits],
         ['Direct fetches', status.stats.directFetches],
         ['Browser fetches', status.stats.browserFetches],
+        ['Proxy rotations', status.proxyPool.rotations],
       ]);
       entries(fields.chromium, [
         ['Connected', status.chromium.connected],
@@ -844,6 +939,14 @@ function manageScript() {
       fields.result.textContent = JSON.stringify(await api('/api/browser/restart', { method: 'POST', body: '{}' }), null, 2);
       await loadStatus();
     });
+    const rotateButton = document.getElementById('rotate-proxy');
+    if (rotateButton) {
+      rotateButton.addEventListener('click', async () => {
+        fields.result.textContent = 'Rotating proxy...';
+        fields.result.textContent = JSON.stringify(await api('/api/proxy/rotate', { method: 'POST', body: '{}' }), null, 2);
+        await loadStatus();
+      });
+    }
     document.getElementById('test-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const path = document.getElementById('test-path').value;
@@ -975,6 +1078,323 @@ function toPort(value, fallback) {
   return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
     ? parsed
     : fallback;
+}
+
+async function getActiveProxyUrl() {
+  if (!AUTO_PROXY_ENABLED) {
+    return OUTBOUND_PROXY_URL;
+  }
+
+  if (proxyState.selectedUrl && !isProxyBad(proxyState.selectedUrl)) {
+    return proxyState.selectedUrl;
+  }
+
+  return selectWorkingProxy();
+}
+
+async function rotateActiveProxy(err) {
+  if (!AUTO_PROXY_ENABLED) {
+    return OUTBOUND_PROXY_URL;
+  }
+
+  if (proxyState.selectedUrl) {
+    markProxyBad(proxyState.selectedUrl, err);
+  }
+
+  proxyState.selectedUrl = '';
+  proxyState.selectedAt = null;
+  proxyState.rotations += 1;
+  await resetBrowser();
+  return selectWorkingProxy();
+}
+
+async function selectWorkingProxy() {
+  if (proxyState.selectPromise) {
+    return proxyState.selectPromise;
+  }
+
+  proxyState.selectPromise = (async () => {
+    const list = await refreshProxyList();
+    let candidates = shuffle(list.filter((proxyUrl) => !isProxyBad(proxyUrl)));
+
+    if (!candidates.length) {
+      proxyState.badUntil.clear();
+      candidates = shuffle(await refreshProxyList(true));
+    }
+
+    const limit = Math.min(PROXY_TEST_CANDIDATES, candidates.length);
+    const limited = candidates.slice(0, limit);
+
+    for (let i = 0; i < limited.length; i += PROXY_TEST_CONCURRENCY) {
+      const batch = limited.slice(i, i + PROXY_TEST_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (proxyUrl) => {
+          try {
+            await testProxy(proxyUrl);
+            return proxyUrl;
+          } catch (err) {
+            markProxyBad(proxyUrl, err);
+            return null;
+          }
+        })
+      );
+      const selected = results.find(Boolean);
+
+      if (selected) {
+        const previous = proxyState.selectedUrl;
+        proxyState.selectedUrl = selected;
+        proxyState.selectedAt = new Date();
+        proxyState.working += 1;
+
+        if (previous && previous !== selected) {
+          await resetBrowser();
+        }
+
+        console.log(`Selected outbound proxy ${maskProxyUrl(selected)}`);
+        return selected;
+      }
+    }
+
+    const err = new Error('No working proxy found in sampled proxy list');
+    err.name = 'ProxySelectionError';
+    err.code = 'PROXY_SELECTION_FAILED';
+    err.statusCode = 502;
+    err.publicMessage = 'No working outbound proxy is currently available';
+    err.publicDetail =
+      'The proxy list was fetched, but sampled proxies failed HTTPS connectivity or were blocked by RoutineHub.';
+    proxyState.lastError = serializeError(err);
+    throw err;
+  })().finally(() => {
+    proxyState.selectPromise = null;
+  });
+
+  return proxyState.selectPromise;
+}
+
+async function refreshProxyList(force = false) {
+  if (!AUTO_PROXY_ENABLED) {
+    return [];
+  }
+
+  const fresh =
+    proxyState.list.length &&
+    Date.now() - proxyState.fetchedAt < PROXY_LIST_REFRESH_MS;
+
+  if (fresh && !force) {
+    return proxyState.list;
+  }
+
+  if (proxyState.refreshPromise) {
+    return proxyState.refreshPromise;
+  }
+
+  proxyState.refreshPromise = (async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(PROXY_LIST_URL, {
+        headers: {
+          Accept: 'text/plain,*/*;q=0.8',
+          'User-Agent': USER_AGENT,
+        },
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Proxy list fetch failed with HTTP ${response.status}`);
+      }
+
+      const text = await response.text();
+      const proxies = Array.from(
+        new Set(
+          text
+            .split(/\r?\n/)
+            .map(normalizeProxyUrl)
+            .filter(Boolean)
+        )
+      );
+
+      if (!proxies.length) {
+        throw new Error('Proxy list did not contain usable proxy URLs');
+      }
+
+      proxyState.list = proxies;
+      proxyState.fetchedAt = Date.now();
+      console.log(`Loaded ${proxies.length} proxies from proxy list`);
+      return proxies;
+    } catch (err) {
+      proxyState.lastError = serializeError(err);
+      if (proxyState.list.length) {
+        return proxyState.list;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  })().finally(() => {
+    proxyState.refreshPromise = null;
+  });
+
+  return proxyState.refreshPromise;
+}
+
+async function testProxy(proxyUrl) {
+  proxyState.tested += 1;
+  proxyState.lastTestAt = new Date();
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PROXY_TEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(PROXY_TEST_URL, {
+      dispatcher: getFetchDispatcher(proxyUrl),
+      headers: {
+        Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
+        'User-Agent': USER_AGENT,
+      },
+      signal: controller.signal,
+    });
+    const body = await response.text();
+
+    assertNotCloudflareBlocked(body, 'proxy-test');
+
+    if (response.status === 407) {
+      throw new Error('Proxy authentication required');
+    }
+
+    if (response.status >= 500) {
+      throw new Error(`Proxy test returned HTTP ${response.status}`);
+    }
+
+    return true;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function getFetchDispatcher(proxyUrl) {
+  if (!proxyUrl) {
+    return undefined;
+  }
+
+  if (!fetchDispatchers.has(proxyUrl)) {
+    fetchDispatchers.set(proxyUrl, createFetchDispatcher(proxyUrl));
+  }
+
+  return fetchDispatchers.get(proxyUrl);
+}
+
+function markProxyBad(proxyUrl, err) {
+  if (!proxyUrl) {
+    return;
+  }
+
+  proxyState.failed += 1;
+  proxyState.badUntil.set(proxyUrl, Date.now() + PROXY_BAD_TTL_MS);
+  proxyState.lastError = serializeError(err);
+}
+
+function isProxyBad(proxyUrl) {
+  const badUntil = proxyState.badUntil.get(proxyUrl);
+  if (!badUntil) {
+    return false;
+  }
+
+  if (badUntil <= Date.now()) {
+    proxyState.badUntil.delete(proxyUrl);
+    return false;
+  }
+
+  return true;
+}
+
+function shouldRotateProxy(err) {
+  if (!err || !AUTO_PROXY_ENABLED) {
+    return false;
+  }
+
+  if (err.code === 'UPSTREAM_ASN_BLOCKED') {
+    return true;
+  }
+
+  const message = String(err.message || '').toLowerCase();
+  return [
+    'tunnel_connection_failed',
+    'proxy',
+    'econnreset',
+    'econnrefused',
+    'etimedout',
+    'enotfound',
+    'ehostunreach',
+    'network changed',
+    'socket hang up',
+    'fetch failed',
+    'aborted',
+    'timeout',
+  ].some((part) => message.includes(part));
+}
+
+function getProxyStatus() {
+  return {
+    autoEnabled: AUTO_PROXY_ENABLED,
+    listConfigured: Boolean(PROXY_LIST_URL),
+    listSize: proxyState.list.length,
+    fetchedAt: proxyState.fetchedAt
+      ? new Date(proxyState.fetchedAt).toISOString()
+      : null,
+    selectedProxy: maskProxyUrl(proxyState.selectedUrl),
+    selectedAt: proxyState.selectedAt
+      ? proxyState.selectedAt.toISOString()
+      : null,
+    badCount: Array.from(proxyState.badUntil.keys()).filter(isProxyBad).length,
+    tested: proxyState.tested,
+    working: proxyState.working,
+    failed: proxyState.failed,
+    rotations: proxyState.rotations,
+    lastTestAt: proxyState.lastTestAt
+      ? proxyState.lastTestAt.toISOString()
+      : null,
+    lastError: proxyState.lastError,
+    testCandidates: PROXY_TEST_CANDIDATES,
+    testConcurrency: PROXY_TEST_CONCURRENCY,
+    testTimeoutMs: PROXY_TEST_TIMEOUT_MS,
+  };
+}
+
+function normalizeProxyUrl(value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed || trimmed.startsWith('#')) {
+    return null;
+  }
+
+  const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+    ? trimmed
+    : `http://${trimmed}`;
+
+  try {
+    const parsed = new URL(withProtocol);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return null;
+    }
+
+    if (!parsed.hostname || !parsed.port) {
+      return null;
+    }
+
+    return parsed.toString();
+  } catch (_err) {
+    return null;
+  }
+}
+
+function shuffle(values) {
+  const result = values.slice();
+  for (let i = result.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
 }
 
 function createFetchDispatcher(proxyUrl) {
