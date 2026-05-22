@@ -50,7 +50,7 @@ These environment variables are optional:
 | `AUTO_PROXY_ENABLED` | `true` in deploy script | Enables random working proxy selection from `PROXY_LIST_URL`. |
 | `PROXY_TEST_CANDIDATES` | `40` in deploy script | Max randomly sampled proxies tested per selection cycle. |
 | `PROXY_TEST_CONCURRENCY` | `4` | Number of proxy tests run at once. |
-| `PROXY_RETRY_LIMIT` | `6` | Max proxy rotations attempted for one request. |
+| `PROXY_RETRY_LIMIT` | `6` | Max proxy rotations attempted for one request after detected RoutineHub/Cloudflare block responses. |
 | `MANAGE_ENABLED` | `true` in deploy script | Enables the management UI. |
 | `MANAGE_HOST` | `0.0.0.0` in deploy script | Management UI bind address. |
 | `MANAGE_PORT` | `9999` | Management UI port. |

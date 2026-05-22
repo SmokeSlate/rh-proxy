@@ -245,7 +245,7 @@ async function fetchRoutineHub(url) {
       }
 
       console.warn(
-        `Proxy attempt ${attempt} failed, rotating proxy: ${err.message}`
+        `Blocked proxy attempt ${attempt}, rotating proxy: ${err.message}`
       );
       await rotateActiveProxy(err);
     }
@@ -277,7 +277,10 @@ async function fetchDirect(url) {
     const bodyContent = await response.text();
     const contentType = response.headers.get('content-type') || '';
 
-    assertNotCloudflareBlocked(bodyContent, 'direct');
+    assertNotCloudflareBlocked(bodyContent, 'direct', {
+      status: response.status,
+      headers: response.headers,
+    });
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
@@ -322,7 +325,7 @@ async function fetchWithBrowser(url) {
       request.continue();
     });
 
-    await page.goto(url, {
+    const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout: REQUEST_TIMEOUT_MS,
     });
@@ -341,7 +344,10 @@ async function fetchWithBrowser(url) {
         : '')
     );
 
-    assertNotCloudflareBlocked(`${bodyContent}\n${content}`, 'browser');
+    assertNotCloudflareBlocked(`${bodyContent}\n${content}`, 'browser', {
+      status: response ? response.status() : null,
+      headers: response ? response.headers() : {},
+    });
 
     return {
       bodyContent,
@@ -1257,7 +1263,10 @@ async function testProxy(proxyUrl) {
     });
     const body = await response.text();
 
-    assertNotCloudflareBlocked(body, 'proxy-test');
+    assertNotCloudflareBlocked(body, 'proxy-test', {
+      status: response.status,
+      headers: response.headers,
+    });
 
     if (response.status === 407) {
       throw new Error('Proxy authentication required');
@@ -1314,25 +1323,11 @@ function shouldRotateProxy(err) {
     return false;
   }
 
-  if (err.code === 'UPSTREAM_ASN_BLOCKED') {
-    return true;
-  }
-
-  const message = String(err.message || '').toLowerCase();
-  return [
-    'tunnel_connection_failed',
-    'proxy',
-    'econnreset',
-    'econnrefused',
-    'etimedout',
-    'enotfound',
-    'ehostunreach',
-    'network changed',
-    'socket hang up',
-    'fetch failed',
-    'aborted',
-    'timeout',
-  ].some((part) => message.includes(part));
+  return (
+    err.isBlocked === true ||
+    err.code === 'UPSTREAM_BLOCKED' ||
+    err.code === 'UPSTREAM_ASN_BLOCKED'
+  );
 }
 
 function getProxyStatus() {
@@ -1422,25 +1417,77 @@ function parseBrowserProxy(proxyUrl) {
   };
 }
 
-function assertNotCloudflareBlocked(text, source) {
-  const normalized = text.toLowerCase();
-  const isAsnBlocked =
-    normalized.includes('error 1005') ||
-    (normalized.includes('autonomous system number') &&
-      normalized.includes('banned'));
-
-  if (!isAsnBlocked) {
+function assertNotCloudflareBlocked(text, source, responseInfo = {}) {
+  if (!isCloudflareBlocked(text, responseInfo)) {
     return;
   }
 
-  const err = new Error(`RoutineHub blocked the ${source} request by ASN/IP`);
+  const err = new Error(`RoutineHub blocked the ${source} request`);
   err.name = 'UpstreamBlockedError';
-  err.code = 'UPSTREAM_ASN_BLOCKED';
+  err.code = 'UPSTREAM_BLOCKED';
   err.statusCode = 502;
-  err.publicMessage = 'RoutineHub blocked this deployment IP/ASN';
+  err.isBlocked = true;
+  err.publicMessage = 'RoutineHub blocked the selected outbound IP/proxy';
   err.publicDetail =
-    'This host egress IP/ASN is being blocked by RoutineHub/Cloudflare. Use OUTBOUND_PROXY_URL with a non-blocked proxy, deploy on a different provider/IP, or ask RoutineHub to whitelist this host.';
+    'The selected egress IP/proxy was blocked by RoutineHub/Cloudflare. The proxy will rotate on detected block responses until a working proxy is found or the retry limit is reached.';
   throw err;
+}
+
+function isCloudflareBlocked(text, responseInfo = {}) {
+  const normalized = String(text || '').toLowerCase();
+  const headers = normalizeHeaders(responseInfo.headers);
+  const status = Number(responseInfo.status || 0);
+  const contentType = headers['content-type'] || '';
+  const server = headers.server || '';
+  const hasCloudflareHeader =
+    server.includes('cloudflare') ||
+    Boolean(headers['cf-ray'] || headers['cf-cache-status']);
+  const hasCloudflareText = normalized.includes('cloudflare');
+  const hasHtmlBody =
+    contentType.includes('html') || normalized.includes('<html');
+  const hasKnownBlockText =
+    normalized.includes('error 1005') ||
+    normalized.includes('error 1020') ||
+    (normalized.includes('autonomous system number') &&
+      normalized.includes('banned')) ||
+    (normalized.includes('the owner of this website') &&
+      normalized.includes('has banned')) ||
+    (hasCloudflareText &&
+      (normalized.includes('access denied') ||
+        normalized.includes('you have been blocked') ||
+        normalized.includes('attention required')));
+
+  if (hasKnownBlockText) {
+    return true;
+  }
+
+  return (
+    [403, 429, 503].includes(status) &&
+    hasCloudflareHeader &&
+    hasHtmlBody &&
+    (hasCloudflareText || status === 403)
+  );
+}
+
+function normalizeHeaders(headers = {}) {
+  const normalized = {};
+
+  if (!headers) {
+    return normalized;
+  }
+
+  if (typeof headers.forEach === 'function') {
+    headers.forEach((value, key) => {
+      normalized[String(key).toLowerCase()] = String(value).toLowerCase();
+    });
+    return normalized;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    normalized[String(key).toLowerCase()] = String(value).toLowerCase();
+  }
+
+  return normalized;
 }
 
 function maskProxyUrl(proxyUrl) {
