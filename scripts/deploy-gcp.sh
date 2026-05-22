@@ -189,9 +189,9 @@ install_repo() {
 
   if [[ -d "${APP_DIR}/.git" ]]; then
     log "Updating existing checkout"
-    git -C "${APP_DIR}" fetch --depth 1 origin "${BRANCH}"
-    git -C "${APP_DIR}" checkout -q "${BRANCH}" || true
-    git -C "${APP_DIR}" reset --hard "origin/${BRANCH}"
+    git -c safe.directory="${APP_DIR}" -C "${APP_DIR}" fetch --depth 1 origin "${BRANCH}"
+    git -c safe.directory="${APP_DIR}" -C "${APP_DIR}" checkout -q "${BRANCH}" || true
+    git -c safe.directory="${APP_DIR}" -C "${APP_DIR}" reset --hard "origin/${BRANCH}"
   else
     log "Cloning ${REPO_URL}"
     rm -rf "${APP_DIR}"
@@ -254,17 +254,20 @@ exec 9>/run/\${APP_NAME}-update.lock
 flock -n 9 || exit 0
 
 cd "\${APP_DIR}"
-git config --global --add safe.directory "\${APP_DIR}" >/dev/null 2>&1 || true
-current="\$(git rev-parse HEAD)"
-git fetch --quiet --depth 1 origin "\${BRANCH}"
-latest="\$(git rev-parse "origin/\${BRANCH}")"
+git_safe() {
+  git -c safe.directory="\${APP_DIR}" "\$@"
+}
+
+current="\$(git_safe rev-parse HEAD)"
+git_safe fetch --quiet --depth 1 origin "\${BRANCH}"
+latest="\$(git_safe rev-parse "origin/\${BRANCH}")"
 
 if [[ "\${current}" == "\${latest}" ]]; then
   exit 0
 fi
 
 logger -t "\${APP_NAME}-update" "Updating from \${current} to \${latest}"
-git reset --hard "\${latest}"
+git_safe reset --hard "\${latest}"
 chown -R "\${APP_USER}:\${APP_USER}" "\${APP_DIR}"
 sudo -u "\${APP_USER}" env HOME="\${APP_DIR}" npm --prefix "\${APP_DIR}" ci --omit=dev --no-audit --no-fund
 sudo -u "\${APP_USER}" env HOME="\${APP_DIR}" node --check "\${APP_DIR}/server.js"
