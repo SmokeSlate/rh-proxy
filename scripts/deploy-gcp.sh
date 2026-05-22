@@ -13,6 +13,9 @@ MANAGE_HOST="${MANAGE_HOST:-0.0.0.0}"
 MANAGE_PORT="${MANAGE_PORT:-9999}"
 UPDATE_INTERVAL="${UPDATE_INTERVAL:-5min}"
 MEMORY_MAX="${MEMORY_MAX:-768M}"
+SWAP_FILE="${SWAP_FILE:-/swapfile}"
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-1024}"
+MIN_MEMORY_WITHOUT_SWAP_MB="${MIN_MEMORY_WITHOUT_SWAP_MB:-1400}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this script as root, for example: sudo bash scripts/deploy-gcp.sh" >&2
@@ -27,6 +30,42 @@ log() {
 
 apt_install() {
   apt-get install -y --no-install-recommends "$@"
+}
+
+memory_total_mb() {
+  awk '/MemTotal:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo
+}
+
+swap_total_mb() {
+  awk '/SwapTotal:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo
+}
+
+ensure_swap() {
+  local memory_mb
+  local swap_mb
+  memory_mb="$(memory_total_mb)"
+  swap_mb="$(swap_total_mb)"
+
+  if [[ "${memory_mb}" -ge "${MIN_MEMORY_WITHOUT_SWAP_MB}" || "${swap_mb}" -gt 0 ]]; then
+    log "Memory ${memory_mb}MB, swap ${swap_mb}MB"
+    return
+  fi
+
+  log "Memory is ${memory_mb}MB with no swap; creating ${SWAP_SIZE_MB}MB swap at ${SWAP_FILE}"
+  if [[ ! -f "${SWAP_FILE}" ]]; then
+    if command -v fallocate >/dev/null 2>&1; then
+      fallocate -l "${SWAP_SIZE_MB}M" "${SWAP_FILE}" || dd if=/dev/zero of="${SWAP_FILE}" bs=1M count="${SWAP_SIZE_MB}"
+    else
+      dd if=/dev/zero of="${SWAP_FILE}" bs=1M count="${SWAP_SIZE_MB}"
+    fi
+    chmod 0600 "${SWAP_FILE}"
+    mkswap "${SWAP_FILE}"
+  fi
+
+  swapon "${SWAP_FILE}" || true
+  if ! grep -qE "^[^#].*[[:space:]]${SWAP_FILE//\//\\/}[[:space:]]" /etc/fstab; then
+    printf '%s none swap sw 0 0\n' "${SWAP_FILE}" >>/etc/fstab
+  fi
 }
 
 node_major() {
@@ -262,6 +301,7 @@ main() {
   log "Installing OS packages"
   apt-get update
   apt_install ca-certificates curl git gnupg openssl sudo util-linux
+  ensure_swap
   install_node
   chrome_path="$(install_chromium | tail -n 1)"
   log "Using Chromium at ${chrome_path}"
