@@ -316,7 +316,8 @@ main() {
   write_updater
 
   systemctl daemon-reload
-  systemctl enable --now "${APP_NAME}.service"
+  systemctl enable "${APP_NAME}.service"
+  systemctl restart "${APP_NAME}.service"
   systemctl enable --now "${APP_NAME}-update.timer"
 
   manage_token="$(read_env_value MANAGE_TOKEN "${ENV_FILE}")"
