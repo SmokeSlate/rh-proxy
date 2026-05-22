@@ -1510,6 +1510,9 @@ function normalizeOptionalProxyUrl(value, key) {
     if (!parsed.hostname || !parsed.port) {
       throw new Error('missing host or port');
     }
+    if (parsed.protocol === 'https:') {
+      parsed.protocol = 'http:';
+    }
     return parsed.toString();
   } catch (_err) {
     throw settingError(
@@ -1944,6 +1947,7 @@ function normalizeProxyUrl(value) {
       return null;
     }
 
+    parsed.protocol = 'http:';
     return parsed.toString();
   } catch (_err) {
     return null;
