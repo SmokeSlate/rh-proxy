@@ -133,7 +133,7 @@ app.use(async (req, res) => {
     stats.lastProxyError = serializeError(err);
     console.error('Proxy error:', err);
     await resetBrowser();
-    res.status(err.statusCode || 502).json({
+    res.status(err.statusCode || 424).json({
       error: err.publicMessage || 'Unable to fetch RoutineHub data',
       code: err.code || 'UPSTREAM_FETCH_FAILED',
       detail: err.publicDetail,
@@ -590,7 +590,7 @@ function createManageApp() {
         preview: result.bodyContent.slice(0, 500),
       });
     } catch (err) {
-      res.status(err.statusCode || 502).json({
+      res.status(err.statusCode || 424).json({
         ok: false,
         durationMs: Date.now() - startedAt,
         error: err.publicMessage || err.message,
@@ -1730,7 +1730,7 @@ async function selectWorkingProxy() {
     const err = new Error('No working proxy found in sampled proxy list');
     err.name = 'ProxySelectionError';
     err.code = 'PROXY_SELECTION_FAILED';
-    err.statusCode = 502;
+    err.statusCode = 424;
     err.publicMessage = 'No working outbound proxy is currently available';
     err.publicDetail =
       'The proxy list was fetched, but sampled proxies failed HTTPS connectivity or were blocked by RoutineHub.';
@@ -1991,7 +1991,7 @@ function assertNotCloudflareBlocked(text, source, responseInfo = {}) {
   const err = new Error(`RoutineHub blocked the ${source} request`);
   err.name = 'UpstreamBlockedError';
   err.code = 'UPSTREAM_BLOCKED';
-  err.statusCode = 502;
+  err.statusCode = 424;
   err.isBlocked = true;
   err.publicMessage = 'RoutineHub blocked the selected outbound IP/proxy';
   err.publicDetail =
