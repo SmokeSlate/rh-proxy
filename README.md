@@ -30,6 +30,16 @@ Management UI:
 http://<instance-ip>:9999/?token=<printed-token>
 ```
 
+The management UI can update the proxy list URL, fixed outbound proxy, retry/test settings, cache settings, and request settings at runtime. Changes are persisted to `SETTINGS_FILE` and applied immediately without touching other services on the VM.
+
+The same settings are available through the management API:
+
+```sh
+curl -X PATCH "http://<instance-ip>:9999/api/settings?token=<token>" \
+  -H "Content-Type: application/json" \
+  -d '{"settings":{"PROXY_LIST_URL":"https://example.com/proxies.txt","AUTO_PROXY_ENABLED":true}}'
+```
+
 If the ports are not reachable externally, open GCP firewall TCP ports `80` and `9999`.
 
 ## Runtime settings
@@ -47,6 +57,7 @@ These environment variables are optional:
 | `DIRECT_FETCH_FIRST` | `true` | Try a cheap HTTP fetch before launching Chromium. Set `false` to always use Chromium. |
 | `OUTBOUND_PROXY_URL` | unset | Optional HTTP/SOCKS proxy used for requests to RoutineHub. Useful when a host ASN is blocked by RoutineHub/Cloudflare. |
 | `PROXY_LIST_URL` | ProxyScrape URL in deploy script | Text list of `http://ip:port` proxies to sample when no fixed proxy is configured. |
+| `SETTINGS_FILE` | `/opt/rh-proxy/runtime-settings.json` in deploy script | App-writable runtime settings override file managed by the UI/API. |
 | `AUTO_PROXY_ENABLED` | `true` in deploy script | Enables random working proxy selection from `PROXY_LIST_URL`. |
 | `PROXY_TEST_CANDIDATES` | `40` in deploy script | Max randomly sampled proxies tested per selection cycle. |
 | `PROXY_TEST_CONCURRENCY` | `4` | Number of proxy tests run at once. |

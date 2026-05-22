@@ -2,6 +2,8 @@
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const fs = require('fs');
+const path = require('path');
 const { ProxyAgent } = require('undici');
 const { addExtra } = require('puppeteer-extra');
 const puppeteerCore = require('puppeteer-core');
@@ -19,52 +21,34 @@ const MANAGE_HOST = process.env.MANAGE_HOST || '0.0.0.0';
 const MANAGE_PORT = toPort(process.env.MANAGE_PORT, 9999);
 const MANAGE_ENABLED = process.env.MANAGE_ENABLED !== 'false';
 const MANAGE_TOKEN = process.env.MANAGE_TOKEN || '';
-const BASE_API = withTrailingSlash(
-  process.env.ROUTINEHUB_API_BASE || 'https://routinehub.co/api/v1/'
-);
-const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 30000);
-const CACHE_TTL_MS = toNonNegativeInt(process.env.CACHE_TTL_MS, 30000);
-const MAX_CACHE_ENTRIES = toPositiveInt(process.env.MAX_CACHE_ENTRIES, 100);
-const MAX_BROWSER_PAGES = toPositiveInt(process.env.MAX_BROWSER_PAGES, 2);
-const RATE_LIMIT_MAX = toPositiveInt(process.env.RATE_LIMIT_MAX, 60);
-const DIRECT_FETCH_FIRST = process.env.DIRECT_FETCH_FIRST !== 'false';
-const OUTBOUND_PROXY_URL = process.env.OUTBOUND_PROXY_URL || '';
-const PROXY_LIST_URL = process.env.PROXY_LIST_URL || '';
-const AUTO_PROXY_ENABLED =
-  process.env.AUTO_PROXY_ENABLED !== 'false' && Boolean(PROXY_LIST_URL);
-const PROXY_LIST_REFRESH_MS = toPositiveInt(
-  process.env.PROXY_LIST_REFRESH_MS,
-  10 * 60 * 1000
-);
-const PROXY_TEST_TIMEOUT_MS = toPositiveInt(
-  process.env.PROXY_TEST_TIMEOUT_MS,
-  5000
-);
-const PROXY_TEST_CANDIDATES = toPositiveInt(
-  process.env.PROXY_TEST_CANDIDATES,
-  32
-);
-const PROXY_TEST_CONCURRENCY = toPositiveInt(
-  process.env.PROXY_TEST_CONCURRENCY,
-  4
-);
-const PROXY_BAD_TTL_MS = toPositiveInt(
-  process.env.PROXY_BAD_TTL_MS,
-  30 * 60 * 1000
-);
-const PROXY_RETRY_LIMIT = toPositiveInt(process.env.PROXY_RETRY_LIMIT, 5);
-const PROXY_TEST_URL =
-  process.env.PROXY_TEST_URL ||
-  new URL('shortcuts/6565/versions/latest', BASE_API).toString();
 const CHROME_PATH =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   process.env.CHROME_BIN ||
   '/usr/bin/chromium';
-
-const USER_AGENT =
-  process.env.USER_AGENT ||
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const SETTINGS_FILE =
+  process.env.SETTINGS_FILE ||
+  path.join(process.cwd(), 'runtime-settings.json');
+const SETTINGS_KEYS = [
+  'ROUTINEHUB_API_BASE',
+  'REQUEST_TIMEOUT_MS',
+  'CACHE_TTL_MS',
+  'MAX_CACHE_ENTRIES',
+  'MAX_BROWSER_PAGES',
+  'RATE_LIMIT_MAX',
+  'DIRECT_FETCH_FIRST',
+  'OUTBOUND_PROXY_URL',
+  'PROXY_LIST_URL',
+  'AUTO_PROXY_ENABLED',
+  'PROXY_LIST_REFRESH_MS',
+  'PROXY_TEST_TIMEOUT_MS',
+  'PROXY_TEST_CANDIDATES',
+  'PROXY_TEST_CONCURRENCY',
+  'PROXY_BAD_TTL_MS',
+  'PROXY_RETRY_LIMIT',
+  'PROXY_TEST_URL',
+  'USER_AGENT',
+];
+let settings = loadSettings();
 
 let browser;
 let browserPromise;
@@ -78,8 +62,8 @@ const proxyState = {
   fetchedAt: 0,
   refreshPromise: null,
   selectPromise: null,
-  selectedUrl: OUTBOUND_PROXY_URL,
-  selectedAt: OUTBOUND_PROXY_URL ? new Date() : null,
+  selectedUrl: settings.OUTBOUND_PROXY_URL,
+  selectedAt: settings.OUTBOUND_PROXY_URL ? new Date() : null,
   badUntil: new Map(),
   lastError: null,
   lastTestAt: null,
@@ -102,7 +86,7 @@ const stats = {
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
-    max: RATE_LIMIT_MAX,
+    max: () => settings.RATE_LIMIT_MAX,
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => req.path === '/health',
@@ -166,8 +150,8 @@ const server = app.listen(PORT, HOST, () => {
       portEnv: process.env.PORT || null,
       chromePath: CHROME_PATH,
       outboundProxy: maskProxyUrl(proxyState.selectedUrl),
-      autoProxyEnabled: AUTO_PROXY_ENABLED,
-      proxyListUrl: PROXY_LIST_URL ? 'configured' : null,
+      autoProxyEnabled: settings.AUTO_PROXY_ENABLED,
+      proxyListUrl: settings.PROXY_LIST_URL ? 'configured' : null,
       nodeEnv: process.env.NODE_ENV || null,
       nodeVersion: process.version,
     })
@@ -219,11 +203,11 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 
 async function fetchRoutineHub(url) {
   let lastErr;
-  const maxAttempts = AUTO_PROXY_ENABLED ? PROXY_RETRY_LIMIT : 1;
+  const maxAttempts = settings.AUTO_PROXY_ENABLED ? settings.PROXY_RETRY_LIMIT : 1;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      if (DIRECT_FETCH_FIRST) {
+      if (settings.DIRECT_FETCH_FIRST) {
         try {
           stats.directFetches += 1;
           return await fetchDirect(url);
@@ -232,7 +216,7 @@ async function fetchRoutineHub(url) {
             throw err;
           }
 
-          if (AUTO_PROXY_ENABLED && shouldRotateProxy(err)) {
+          if (settings.AUTO_PROXY_ENABLED && shouldRotateProxy(err)) {
             throw err;
           }
           console.warn(`Direct fetch failed, falling back to browser: ${err.message}`);
@@ -244,7 +228,7 @@ async function fetchRoutineHub(url) {
     } catch (err) {
       lastErr = err;
 
-      if (!AUTO_PROXY_ENABLED || !shouldRotateProxy(err) || attempt >= maxAttempts) {
+      if (!settings.AUTO_PROXY_ENABLED || !shouldRotateProxy(err) || attempt >= maxAttempts) {
         throw err;
       }
 
@@ -260,14 +244,14 @@ async function fetchRoutineHub(url) {
 
 async function fetchDirect(url) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), settings.REQUEST_TIMEOUT_MS);
 
   try {
     const proxyUrl = await getActiveProxyUrl();
     const fetchOptions = {
       headers: {
         Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
-        'User-Agent': USER_AGENT,
+        'User-Agent': settings.USER_AGENT,
       },
       signal: controller.signal,
     };
@@ -311,10 +295,10 @@ async function fetchWithBrowser(url) {
   const page = await b.newPage();
 
   try {
-    page.setDefaultNavigationTimeout(REQUEST_TIMEOUT_MS);
-    page.setDefaultTimeout(REQUEST_TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(settings.REQUEST_TIMEOUT_MS);
+    page.setDefaultTimeout(settings.REQUEST_TIMEOUT_MS);
 
-    await page.setUserAgent(USER_AGENT);
+    await page.setUserAgent(settings.USER_AGENT);
     if (browserProxy && browserProxy.auth) {
       await page.authenticate(browserProxy.auth);
     }
@@ -331,13 +315,13 @@ async function fetchWithBrowser(url) {
 
     const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: REQUEST_TIMEOUT_MS,
+      timeout: settings.REQUEST_TIMEOUT_MS,
     });
 
     await page
       .waitForNetworkIdle({
         idleTime: 500,
-        timeout: Math.min(5000, REQUEST_TIMEOUT_MS),
+        timeout: Math.min(5000, settings.REQUEST_TIMEOUT_MS),
       })
       .catch(() => {});
 
@@ -431,7 +415,7 @@ function withBrowserSlot(task) {
       }
     };
 
-    if (activeBrowserPages < MAX_BROWSER_PAGES) {
+    if (activeBrowserPages < settings.MAX_BROWSER_PAGES) {
       run();
       return;
     }
@@ -470,7 +454,7 @@ function buildTargetUrl(req) {
   const cleanPath = pathPart
     .replace(/^\/api\/v1\/?/, '')
     .replace(/^\/+/, '');
-  const target = new URL(cleanPath, BASE_API);
+  const target = new URL(cleanPath, settings.ROUTINEHUB_API_BASE);
 
   if (queryString) {
     target.search = `?${queryString}`;
@@ -521,6 +505,54 @@ function createManageApp() {
 
   manageApp.get('/api/status', requireManageAuth, (_req, res) => {
     res.json(getManageStatus());
+  });
+
+  manageApp.get('/api/settings', requireManageAuth, (_req, res) => {
+    res.json({
+      ok: true,
+      file: SETTINGS_FILE,
+      settings: getPublicSettings(),
+    });
+  });
+
+  manageApp.patch('/api/settings', requireManageAuth, async (req, res) => {
+    try {
+      const result = await updateRuntimeSettings(req.body.settings || req.body || {});
+      res.json({
+        ok: true,
+        file: SETTINGS_FILE,
+        changed: result.changed,
+        settings: getPublicSettings(),
+        proxy: getProxyStatus(),
+      });
+    } catch (err) {
+      res.status(err.statusCode || 400).json({
+        ok: false,
+        error: err.publicMessage || err.message,
+        code: err.code || 'SETTINGS_UPDATE_FAILED',
+        detail: err.publicDetail,
+      });
+    }
+  });
+
+  manageApp.post('/api/settings/reset', requireManageAuth, async (_req, res) => {
+    try {
+      const result = await resetRuntimeSettings();
+      res.json({
+        ok: true,
+        file: SETTINGS_FILE,
+        changed: result.changed,
+        settings: getPublicSettings(),
+        proxy: getProxyStatus(),
+      });
+    } catch (err) {
+      res.status(err.statusCode || 500).json({
+        ok: false,
+        error: err.publicMessage || err.message,
+        code: err.code || 'SETTINGS_RESET_FAILED',
+        detail: err.publicDetail,
+      });
+    }
   });
 
   manageApp.post('/api/cache/clear', requireManageAuth, (_req, res) => {
@@ -615,11 +647,11 @@ function getManageStatus() {
     proxy: {
       host: HOST,
       port: PORT,
-      baseApi: BASE_API,
-      outboundProxy: maskProxyUrl(OUTBOUND_PROXY_URL),
-      directFetchFirst: DIRECT_FETCH_FIRST,
-      requestTimeoutMs: REQUEST_TIMEOUT_MS,
-      autoProxyEnabled: AUTO_PROXY_ENABLED,
+      baseApi: settings.ROUTINEHUB_API_BASE,
+      outboundProxy: maskProxyUrl(settings.OUTBOUND_PROXY_URL),
+      directFetchFirst: settings.DIRECT_FETCH_FIRST,
+      requestTimeoutMs: settings.REQUEST_TIMEOUT_MS,
+      autoProxyEnabled: settings.AUTO_PROXY_ENABLED,
       selectedProxy: maskProxyUrl(proxyState.selectedUrl),
     },
     proxyPool: getProxyStatus(),
@@ -634,12 +666,17 @@ function getManageStatus() {
       connected: Boolean(browser && browser.connected),
       activePages: activeBrowserPages,
       queuedPages: browserQueue.length,
-      maxPages: MAX_BROWSER_PAGES,
+      maxPages: settings.MAX_BROWSER_PAGES,
+    },
+    settings: {
+      file: SETTINGS_FILE,
+      values: getPublicSettings(),
+      editableKeys: SETTINGS_KEYS,
     },
     cache: {
       size: responseCache.size,
-      maxEntries: MAX_CACHE_ENTRIES,
-      ttlMs: CACHE_TTL_MS,
+      maxEntries: settings.MAX_CACHE_ENTRIES,
+      ttlMs: settings.CACHE_TTL_MS,
     },
     stats: {
       proxyRequests: stats.proxyRequests,
@@ -736,6 +773,75 @@ function renderManagePage() {
       </div>
     </section>
 
+    <section class="settings-panel">
+      <div class="section-head">
+        <h2>Settings</h2>
+        <span id="settings-file"></span>
+      </div>
+      <form id="settings-form" class="settings-grid">
+        <label class="wide" for="set-PROXY_LIST_URL">Proxy list URL
+          <input id="set-PROXY_LIST_URL" name="PROXY_LIST_URL" autocomplete="off">
+        </label>
+        <label class="wide" for="set-OUTBOUND_PROXY_URL">Fixed outbound proxy
+          <input id="set-OUTBOUND_PROXY_URL" name="OUTBOUND_PROXY_URL" autocomplete="off" placeholder="http://host:port">
+        </label>
+        <label for="set-AUTO_PROXY_ENABLED" class="check">
+          <input id="set-AUTO_PROXY_ENABLED" name="AUTO_PROXY_ENABLED" type="checkbox">
+          Auto proxy
+        </label>
+        <label for="set-DIRECT_FETCH_FIRST" class="check">
+          <input id="set-DIRECT_FETCH_FIRST" name="DIRECT_FETCH_FIRST" type="checkbox">
+          Direct fetch first
+        </label>
+        <label for="set-PROXY_RETRY_LIMIT">Block retry limit
+          <input id="set-PROXY_RETRY_LIMIT" name="PROXY_RETRY_LIMIT" type="number" min="1" max="100">
+        </label>
+        <label for="set-PROXY_TEST_CANDIDATES">Test candidates
+          <input id="set-PROXY_TEST_CANDIDATES" name="PROXY_TEST_CANDIDATES" type="number" min="1" max="1000">
+        </label>
+        <label for="set-PROXY_TEST_CONCURRENCY">Test concurrency
+          <input id="set-PROXY_TEST_CONCURRENCY" name="PROXY_TEST_CONCURRENCY" type="number" min="1" max="100">
+        </label>
+        <label for="set-PROXY_TEST_TIMEOUT_MS">Proxy test timeout ms
+          <input id="set-PROXY_TEST_TIMEOUT_MS" name="PROXY_TEST_TIMEOUT_MS" type="number" min="1000" max="60000">
+        </label>
+        <label for="set-PROXY_LIST_REFRESH_MS">List refresh ms
+          <input id="set-PROXY_LIST_REFRESH_MS" name="PROXY_LIST_REFRESH_MS" type="number" min="30000">
+        </label>
+        <label for="set-PROXY_BAD_TTL_MS">Bad proxy TTL ms
+          <input id="set-PROXY_BAD_TTL_MS" name="PROXY_BAD_TTL_MS" type="number" min="10000">
+        </label>
+        <label for="set-REQUEST_TIMEOUT_MS">Request timeout ms
+          <input id="set-REQUEST_TIMEOUT_MS" name="REQUEST_TIMEOUT_MS" type="number" min="1000" max="120000">
+        </label>
+        <label for="set-RATE_LIMIT_MAX">Rate limit per minute
+          <input id="set-RATE_LIMIT_MAX" name="RATE_LIMIT_MAX" type="number" min="1" max="10000">
+        </label>
+        <label for="set-CACHE_TTL_MS">Cache TTL ms
+          <input id="set-CACHE_TTL_MS" name="CACHE_TTL_MS" type="number" min="0" max="600000">
+        </label>
+        <label for="set-MAX_CACHE_ENTRIES">Max cache entries
+          <input id="set-MAX_CACHE_ENTRIES" name="MAX_CACHE_ENTRIES" type="number" min="1" max="5000">
+        </label>
+        <label for="set-MAX_BROWSER_PAGES">Max browser pages
+          <input id="set-MAX_BROWSER_PAGES" name="MAX_BROWSER_PAGES" type="number" min="1" max="8">
+        </label>
+        <label class="wide" for="set-PROXY_TEST_URL">Proxy test URL
+          <input id="set-PROXY_TEST_URL" name="PROXY_TEST_URL" autocomplete="off">
+        </label>
+        <label class="wide" for="set-ROUTINEHUB_API_BASE">RoutineHub API base
+          <input id="set-ROUTINEHUB_API_BASE" name="ROUTINEHUB_API_BASE" autocomplete="off">
+        </label>
+        <label class="wide" for="set-USER_AGENT">User agent
+          <input id="set-USER_AGENT" name="USER_AGENT" autocomplete="off">
+        </label>
+        <div class="settings-actions">
+          <button type="submit">Save Settings</button>
+          <button id="reset-settings" type="button">Reset Overrides</button>
+        </div>
+      </form>
+    </section>
+
     <pre id="result"></pre>
   </main>
   <script>${manageScript()}</script>
@@ -793,7 +899,7 @@ function manageStyles() {
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
     }
-    article, .actions, pre, .login {
+    article, .actions, .settings-panel, pre, .login {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -825,6 +931,13 @@ function manageStyles() {
       padding: 0 10px;
       width: 100%;
     }
+    input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      padding: 0;
+      margin: 0;
+      flex: 0 0 auto;
+    }
     label {
       display: block;
       color: var(--muted);
@@ -836,6 +949,39 @@ function manageStyles() {
       gap: 12px;
       align-items: end;
       margin: 12px 0;
+    }
+    .settings-panel { margin: 12px 0; }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    #settings-file {
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      text-align: right;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-items: end;
+    }
+    .settings-grid .wide { grid-column: span 2; }
+    .settings-grid .check {
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
+    }
+    .settings-actions {
+      grid-column: span 2;
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
     }
     .row { display: flex; gap: 8px; }
     .row input { flex: 1; }
@@ -854,11 +1000,16 @@ function manageStyles() {
     .bad { color: var(--bad); }
     @media (max-width: 900px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .actions { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
       .grid { grid-template-columns: 1fr; }
+      .settings-grid { grid-template-columns: 1fr; }
+      .settings-grid .wide, .settings-actions { grid-column: span 1; }
       header, .row { flex-direction: column; align-items: stretch; }
+      .section-head { flex-direction: column; }
+      #settings-file { text-align: left; }
     }
   </style>`;
 }
@@ -872,7 +1023,23 @@ function manageScript() {
       memory: document.getElementById('memory'),
       result: document.getElementById('result'),
       subline: document.getElementById('subline'),
+      settingsFile: document.getElementById('settings-file'),
     };
+    const settingKeys = ${JSON.stringify(SETTINGS_KEYS)};
+    const booleanSettings = new Set(['AUTO_PROXY_ENABLED', 'DIRECT_FETCH_FIRST']);
+    const numericSettings = new Set([
+      'REQUEST_TIMEOUT_MS',
+      'CACHE_TTL_MS',
+      'MAX_CACHE_ENTRIES',
+      'MAX_BROWSER_PAGES',
+      'RATE_LIMIT_MAX',
+      'PROXY_LIST_REFRESH_MS',
+      'PROXY_TEST_TIMEOUT_MS',
+      'PROXY_TEST_CANDIDATES',
+      'PROXY_TEST_CONCURRENCY',
+      'PROXY_BAD_TTL_MS',
+      'PROXY_RETRY_LIMIT',
+    ]);
 
     function entries(target, rows) {
       target.innerHTML = rows
@@ -903,15 +1070,45 @@ function manageScript() {
       return data;
     }
 
+    function setSettingsForm(values) {
+      for (const key of settingKeys) {
+        const input = document.getElementById('set-' + key);
+        if (!input) continue;
+        if (booleanSettings.has(key)) {
+          input.checked = Boolean(values[key]);
+        } else {
+          input.value = values[key] ?? '';
+        }
+      }
+    }
+
+    function readSettingsForm() {
+      return settingKeys.reduce((result, key) => {
+        const input = document.getElementById('set-' + key);
+        if (!input) return result;
+        if (booleanSettings.has(key)) {
+          result[key] = input.checked;
+        } else if (numericSettings.has(key)) {
+          result[key] = Number(input.value);
+        } else {
+          result[key] = input.value.trim();
+        }
+        return result;
+      }, {});
+    }
+
     async function loadStatus() {
       const status = await api('/api/status');
       fields.subline.innerHTML = status.ok
         ? '<span class="ok">Online</span> · uptime ' + status.uptimeSeconds + 's'
         : '<span class="bad">Issue detected</span>';
+      fields.settingsFile.textContent = status.settings.file;
+      setSettingsForm(status.settings.values);
       entries(fields.runtime, [
         ['Proxy', status.proxy.host + ':' + status.proxy.port],
         ['Manage', status.management.host + ':' + status.management.port],
         ['Base API', status.proxy.baseApi],
+        ['Proxy list', status.proxyPool.listConfigured ? 'configured' : 'none'],
         ['Proxy URL', status.proxy.selectedProxy || status.proxy.outboundProxy || 'none'],
         ['Auto proxy', status.proxy.autoProxyEnabled],
         ['Node', status.nodeVersion],
@@ -957,6 +1154,31 @@ function manageScript() {
         await loadStatus();
       });
     }
+    document.getElementById('settings-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      fields.result.textContent = 'Saving settings...';
+      try {
+        fields.result.textContent = JSON.stringify(await api('/api/settings', {
+          method: 'PATCH',
+          body: JSON.stringify({ settings: readSettingsForm() }),
+        }), null, 2);
+      } catch (err) {
+        fields.result.textContent = JSON.stringify(err, null, 2);
+      }
+      await loadStatus();
+    });
+    document.getElementById('reset-settings').addEventListener('click', async () => {
+      fields.result.textContent = 'Resetting settings...';
+      try {
+        fields.result.textContent = JSON.stringify(await api('/api/settings/reset', {
+          method: 'POST',
+          body: '{}',
+        }), null, 2);
+      } catch (err) {
+        fields.result.textContent = JSON.stringify(err, null, 2);
+      }
+      await loadStatus();
+    });
     document.getElementById('test-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const path = document.getElementById('test-path').value;
@@ -1007,8 +1229,348 @@ function buildTargetUrlFromPath(path) {
   }
 
   const cleanPath = path.replace(/^https:\/\/routinehub\.co\/api\/v1\//i, '');
-  const target = new URL(cleanPath.replace(/^\/+/, ''), BASE_API);
+  const target = new URL(cleanPath.replace(/^\/+/, ''), settings.ROUTINEHUB_API_BASE);
   return target.toString();
+}
+
+function loadSettings() {
+  try {
+    return buildEffectiveSettings(readSettingsOverrides());
+  } catch (err) {
+    console.error(`Invalid settings file ${SETTINGS_FILE}, using env defaults:`, err);
+    return buildEffectiveSettings({});
+  }
+}
+
+function defaultSettingsFromEnv() {
+  const baseApi = withTrailingSlash(
+    process.env.ROUTINEHUB_API_BASE || 'https://routinehub.co/api/v1/'
+  );
+  const proxyListUrl = process.env.PROXY_LIST_URL || '';
+
+  return {
+    ROUTINEHUB_API_BASE: baseApi,
+    REQUEST_TIMEOUT_MS: toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 30000),
+    CACHE_TTL_MS: toNonNegativeInt(process.env.CACHE_TTL_MS, 30000),
+    MAX_CACHE_ENTRIES: toPositiveInt(process.env.MAX_CACHE_ENTRIES, 100),
+    MAX_BROWSER_PAGES: toPositiveInt(process.env.MAX_BROWSER_PAGES, 2),
+    RATE_LIMIT_MAX: toPositiveInt(process.env.RATE_LIMIT_MAX, 60),
+    DIRECT_FETCH_FIRST: parseBooleanSetting(
+      process.env.DIRECT_FETCH_FIRST,
+      true
+    ),
+    OUTBOUND_PROXY_URL: process.env.OUTBOUND_PROXY_URL || '',
+    PROXY_LIST_URL: proxyListUrl,
+    AUTO_PROXY_ENABLED:
+      parseBooleanSetting(process.env.AUTO_PROXY_ENABLED, true) &&
+      Boolean(proxyListUrl),
+    PROXY_LIST_REFRESH_MS: toPositiveInt(
+      process.env.PROXY_LIST_REFRESH_MS,
+      10 * 60 * 1000
+    ),
+    PROXY_TEST_TIMEOUT_MS: toPositiveInt(
+      process.env.PROXY_TEST_TIMEOUT_MS,
+      5000
+    ),
+    PROXY_TEST_CANDIDATES: toPositiveInt(
+      process.env.PROXY_TEST_CANDIDATES,
+      32
+    ),
+    PROXY_TEST_CONCURRENCY: toPositiveInt(
+      process.env.PROXY_TEST_CONCURRENCY,
+      4
+    ),
+    PROXY_BAD_TTL_MS: toPositiveInt(
+      process.env.PROXY_BAD_TTL_MS,
+      30 * 60 * 1000
+    ),
+    PROXY_RETRY_LIMIT: toPositiveInt(process.env.PROXY_RETRY_LIMIT, 5),
+    PROXY_TEST_URL:
+      process.env.PROXY_TEST_URL ||
+      new URL('shortcuts/6565/versions/latest', baseApi).toString(),
+    USER_AGENT:
+      process.env.USER_AGENT ||
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  };
+}
+
+function readSettingsOverrides() {
+  try {
+    if (!fs.existsSync(SETTINGS_FILE)) {
+      return {};
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return parsed;
+  } catch (err) {
+    console.error(`Unable to read settings file ${SETTINGS_FILE}:`, err);
+    return {};
+  }
+}
+
+function buildEffectiveSettings(overrides = {}) {
+  const defaults = defaultSettingsFromEnv();
+  const next = { ...defaults };
+
+  for (const key of SETTINGS_KEYS) {
+    if (hasOwn(overrides, key)) {
+      next[key] = normalizeSettingValue(key, overrides[key], next);
+    }
+  }
+
+  next.ROUTINEHUB_API_BASE = withTrailingSlash(next.ROUTINEHUB_API_BASE);
+  next.AUTO_PROXY_ENABLED = Boolean(
+    next.AUTO_PROXY_ENABLED && next.PROXY_LIST_URL
+  );
+  if (!next.PROXY_TEST_URL) {
+    next.PROXY_TEST_URL = new URL(
+      'shortcuts/6565/versions/latest',
+      next.ROUTINEHUB_API_BASE
+    ).toString();
+  }
+
+  return next;
+}
+
+function getPublicSettings() {
+  return SETTINGS_KEYS.reduce((result, key) => {
+    result[key] = settings[key];
+    return result;
+  }, {});
+}
+
+async function updateRuntimeSettings(values) {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    throw settingError('Settings payload must be an object');
+  }
+
+  const currentOverrides = readSettingsOverrides();
+  const nextOverrides = { ...currentOverrides };
+  const nextSettingsBase = buildEffectiveSettings(currentOverrides);
+  const changed = [];
+
+  for (const [key, value] of Object.entries(values)) {
+    if (!SETTINGS_KEYS.includes(key)) {
+      throw settingError(`Unsupported setting: ${key}`, 'UNSUPPORTED_SETTING');
+    }
+
+    const normalized = normalizeSettingValue(key, value, nextSettingsBase);
+    nextOverrides[key] = normalized;
+    nextSettingsBase[key] = normalized;
+    changed.push(key);
+  }
+
+  const nextSettings = buildEffectiveSettings(nextOverrides);
+  writeSettingsOverrides(nextOverrides);
+  await applySettings(nextSettings);
+  return { changed };
+}
+
+async function resetRuntimeSettings() {
+  writeSettingsOverrides({});
+  const nextSettings = buildEffectiveSettings({});
+  await applySettings(nextSettings);
+  return { changed: SETTINGS_KEYS.slice() };
+}
+
+async function applySettings(nextSettings) {
+  const previous = settings;
+  settings = nextSettings;
+
+  const proxyChanged = [
+    'OUTBOUND_PROXY_URL',
+    'PROXY_LIST_URL',
+    'AUTO_PROXY_ENABLED',
+    'PROXY_TEST_URL',
+  ].some((key) => previous[key] !== settings[key]);
+  const browserChanged = previous.USER_AGENT !== settings.USER_AGENT;
+
+  while (responseCache.size > settings.MAX_CACHE_ENTRIES) {
+    responseCache.delete(responseCache.keys().next().value);
+  }
+
+  if (previous.CACHE_TTL_MS !== settings.CACHE_TTL_MS) {
+    responseCache.clear();
+  }
+
+  if (proxyChanged) {
+    resetProxyPool(settings.OUTBOUND_PROXY_URL);
+    fetchDispatchers.clear();
+  }
+
+  if (proxyChanged || browserChanged) {
+    await resetBrowser();
+  }
+}
+
+function resetProxyPool(selectedUrl = '') {
+  proxyState.list = [];
+  proxyState.fetchedAt = 0;
+  proxyState.refreshPromise = null;
+  proxyState.selectPromise = null;
+  proxyState.selectedUrl = selectedUrl;
+  proxyState.selectedAt = selectedUrl ? new Date() : null;
+  proxyState.badUntil.clear();
+  proxyState.lastError = null;
+  proxyState.lastTestAt = null;
+  proxyState.tested = 0;
+  proxyState.working = 0;
+  proxyState.failed = 0;
+  proxyState.rotations = 0;
+}
+
+function writeSettingsOverrides(values) {
+  fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+  const tmp = `${SETTINGS_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(values, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  fs.renameSync(tmp, SETTINGS_FILE);
+}
+
+function normalizeSettingValue(key, value, currentSettings) {
+  switch (key) {
+    case 'ROUTINEHUB_API_BASE':
+      return withTrailingSlash(normalizeHttpUrl(value, key));
+    case 'OUTBOUND_PROXY_URL':
+      return normalizeOptionalProxyUrl(value, key);
+    case 'PROXY_LIST_URL':
+    case 'PROXY_TEST_URL':
+      return normalizeOptionalHttpUrl(value, key);
+    case 'DIRECT_FETCH_FIRST':
+    case 'AUTO_PROXY_ENABLED':
+      return parseBooleanSetting(value, currentSettings[key]);
+    case 'REQUEST_TIMEOUT_MS':
+      return parseIntSetting(value, key, 1000, 120000);
+    case 'CACHE_TTL_MS':
+      return parseIntSetting(value, key, 0, 600000);
+    case 'MAX_CACHE_ENTRIES':
+      return parseIntSetting(value, key, 1, 5000);
+    case 'MAX_BROWSER_PAGES':
+      return parseIntSetting(value, key, 1, 8);
+    case 'RATE_LIMIT_MAX':
+      return parseIntSetting(value, key, 1, 10000);
+    case 'PROXY_LIST_REFRESH_MS':
+      return parseIntSetting(value, key, 30000, 24 * 60 * 60 * 1000);
+    case 'PROXY_TEST_TIMEOUT_MS':
+      return parseIntSetting(value, key, 1000, 60000);
+    case 'PROXY_TEST_CANDIDATES':
+      return parseIntSetting(value, key, 1, 1000);
+    case 'PROXY_TEST_CONCURRENCY':
+      return parseIntSetting(value, key, 1, 100);
+    case 'PROXY_BAD_TTL_MS':
+      return parseIntSetting(value, key, 10000, 24 * 60 * 60 * 1000);
+    case 'PROXY_RETRY_LIMIT':
+      return parseIntSetting(value, key, 1, 100);
+    case 'USER_AGENT':
+      return normalizeNonEmptyString(value, key, 512);
+    default:
+      throw settingError(`Unsupported setting: ${key}`, 'UNSUPPORTED_SETTING');
+  }
+}
+
+function normalizeHttpUrl(value, key) {
+  const text = normalizeNonEmptyString(value, key, 2048);
+  try {
+    const parsed = new URL(text);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('invalid protocol');
+    }
+    return parsed.toString();
+  } catch (_err) {
+    throw settingError(`${key} must be an http(s) URL`, 'INVALID_SETTING');
+  }
+}
+
+function normalizeOptionalHttpUrl(value, key) {
+  const text = String(value || '').trim();
+  return text ? normalizeHttpUrl(text, key) : '';
+}
+
+function normalizeOptionalProxyUrl(value, key) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(text)
+    ? text
+    : `http://${text}`;
+
+  try {
+    const parsed = new URL(withProtocol);
+    if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(parsed.protocol)) {
+      throw new Error('invalid protocol');
+    }
+    if (!parsed.hostname || !parsed.port) {
+      throw new Error('missing host or port');
+    }
+    return parsed.toString();
+  } catch (_err) {
+    throw settingError(
+      `${key} must be a proxy URL like http://host:port or socks5://host:port`,
+      'INVALID_SETTING'
+    );
+  }
+}
+
+function normalizeNonEmptyString(value, key, maxLength) {
+  const text = String(value || '').trim();
+  if (!text || text.length > maxLength) {
+    throw settingError(
+      `${key} must be a non-empty string up to ${maxLength} characters`,
+      'INVALID_SETTING'
+    );
+  }
+  return text;
+}
+
+function parseIntSetting(value, key, min, max) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw settingError(
+      `${key} must be an integer from ${min} to ${max}`,
+      'INVALID_SETTING'
+    );
+  }
+  return parsed;
+}
+
+function parseBooleanSetting(value, fallback) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  const text = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(text)) {
+    return true;
+  }
+  if (['false', '0', 'no', 'off'].includes(text)) {
+    return false;
+  }
+
+  return fallback;
+}
+
+function settingError(message, code = 'INVALID_SETTING') {
+  const err = new Error(message);
+  err.name = 'SettingsError';
+  err.code = code;
+  err.statusCode = 400;
+  err.publicMessage = message;
+  return err;
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function serializeError(err) {
@@ -1026,7 +1588,7 @@ function toMb(value) {
 }
 
 function getCached(key) {
-  if (CACHE_TTL_MS <= 0) {
+  if (settings.CACHE_TTL_MS <= 0) {
     return null;
   }
 
@@ -1046,16 +1608,16 @@ function getCached(key) {
 }
 
 function setCached(key, value) {
-  if (CACHE_TTL_MS <= 0) {
+  if (settings.CACHE_TTL_MS <= 0) {
     return;
   }
 
   responseCache.set(key, {
-    expiresAt: Date.now() + CACHE_TTL_MS,
+    expiresAt: Date.now() + settings.CACHE_TTL_MS,
     value,
   });
 
-  while (responseCache.size > MAX_CACHE_ENTRIES) {
+  while (responseCache.size > settings.MAX_CACHE_ENTRIES) {
     responseCache.delete(responseCache.keys().next().value);
   }
 }
@@ -1091,8 +1653,8 @@ function toPort(value, fallback) {
 }
 
 async function getActiveProxyUrl() {
-  if (!AUTO_PROXY_ENABLED) {
-    return OUTBOUND_PROXY_URL;
+  if (!settings.AUTO_PROXY_ENABLED) {
+    return settings.OUTBOUND_PROXY_URL;
   }
 
   if (proxyState.selectedUrl && !isProxyBad(proxyState.selectedUrl)) {
@@ -1103,8 +1665,8 @@ async function getActiveProxyUrl() {
 }
 
 async function rotateActiveProxy(err) {
-  if (!AUTO_PROXY_ENABLED) {
-    return OUTBOUND_PROXY_URL;
+  if (!settings.AUTO_PROXY_ENABLED) {
+    return settings.OUTBOUND_PROXY_URL;
   }
 
   if (proxyState.selectedUrl) {
@@ -1132,11 +1694,11 @@ async function selectWorkingProxy() {
       candidates = shuffle(await refreshProxyList(true));
     }
 
-    const limit = Math.min(PROXY_TEST_CANDIDATES, candidates.length);
+    const limit = Math.min(settings.PROXY_TEST_CANDIDATES, candidates.length);
     const limited = candidates.slice(0, limit);
 
-    for (let i = 0; i < limited.length; i += PROXY_TEST_CONCURRENCY) {
-      const batch = limited.slice(i, i + PROXY_TEST_CONCURRENCY);
+    for (let i = 0; i < limited.length; i += settings.PROXY_TEST_CONCURRENCY) {
+      const batch = limited.slice(i, i + settings.PROXY_TEST_CONCURRENCY);
       const results = await Promise.all(
         batch.map(async (proxyUrl) => {
           try {
@@ -1182,13 +1744,13 @@ async function selectWorkingProxy() {
 }
 
 async function refreshProxyList(force = false) {
-  if (!AUTO_PROXY_ENABLED) {
+  if (!settings.AUTO_PROXY_ENABLED) {
     return [];
   }
 
   const fresh =
     proxyState.list.length &&
-    Date.now() - proxyState.fetchedAt < PROXY_LIST_REFRESH_MS;
+    Date.now() - proxyState.fetchedAt < settings.PROXY_LIST_REFRESH_MS;
 
   if (fresh && !force) {
     return proxyState.list;
@@ -1200,13 +1762,13 @@ async function refreshProxyList(force = false) {
 
   proxyState.refreshPromise = (async () => {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), settings.REQUEST_TIMEOUT_MS);
 
     try {
-      const response = await fetch(PROXY_LIST_URL, {
+      const response = await fetch(settings.PROXY_LIST_URL, {
         headers: {
           Accept: 'text/plain,*/*;q=0.8',
-          'User-Agent': USER_AGENT,
+          'User-Agent': settings.USER_AGENT,
         },
         signal: controller.signal,
       });
@@ -1254,14 +1816,14 @@ async function testProxy(proxyUrl) {
   proxyState.lastTestAt = new Date();
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PROXY_TEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), settings.PROXY_TEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch(PROXY_TEST_URL, {
+    const response = await fetch(settings.PROXY_TEST_URL, {
       dispatcher: getFetchDispatcher(proxyUrl),
       headers: {
         Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
-        'User-Agent': USER_AGENT,
+        'User-Agent': settings.USER_AGENT,
       },
       signal: controller.signal,
     });
@@ -1304,7 +1866,7 @@ function markProxyBad(proxyUrl, err) {
   }
 
   proxyState.failed += 1;
-  proxyState.badUntil.set(proxyUrl, Date.now() + PROXY_BAD_TTL_MS);
+  proxyState.badUntil.set(proxyUrl, Date.now() + settings.PROXY_BAD_TTL_MS);
   proxyState.lastError = serializeError(err);
 }
 
@@ -1323,7 +1885,7 @@ function isProxyBad(proxyUrl) {
 }
 
 function shouldRotateProxy(err) {
-  if (!err || !AUTO_PROXY_ENABLED) {
+  if (!err || !settings.AUTO_PROXY_ENABLED) {
     return false;
   }
 
@@ -1336,8 +1898,8 @@ function shouldRotateProxy(err) {
 
 function getProxyStatus() {
   return {
-    autoEnabled: AUTO_PROXY_ENABLED,
-    listConfigured: Boolean(PROXY_LIST_URL),
+    autoEnabled: settings.AUTO_PROXY_ENABLED,
+    listConfigured: Boolean(settings.PROXY_LIST_URL),
     listSize: proxyState.list.length,
     fetchedAt: proxyState.fetchedAt
       ? new Date(proxyState.fetchedAt).toISOString()
@@ -1355,9 +1917,9 @@ function getProxyStatus() {
       ? proxyState.lastTestAt.toISOString()
       : null,
     lastError: proxyState.lastError,
-    testCandidates: PROXY_TEST_CANDIDATES,
-    testConcurrency: PROXY_TEST_CONCURRENCY,
-    testTimeoutMs: PROXY_TEST_TIMEOUT_MS,
+    testCandidates: settings.PROXY_TEST_CANDIDATES,
+    testConcurrency: settings.PROXY_TEST_CONCURRENCY,
+    testTimeoutMs: settings.PROXY_TEST_TIMEOUT_MS,
   };
 }
 

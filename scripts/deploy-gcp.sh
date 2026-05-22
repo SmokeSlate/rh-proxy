@@ -165,6 +165,13 @@ write_env_file() {
   if [[ -z "${proxy_list_url}" ]]; then
     proxy_list_url="${DEFAULT_PROXY_LIST_URL}"
   fi
+  local settings_file="${SETTINGS_FILE:-}"
+  if [[ -z "${settings_file}" ]]; then
+    settings_file="$(read_env_value SETTINGS_FILE "${ENV_FILE}" || true)"
+  fi
+  if [[ -z "${settings_file}" ]]; then
+    settings_file="${APP_DIR}/runtime-settings.json"
+  fi
 
   cat >"${ENV_FILE}" <<EOF_ENV
 NODE_ENV=production
@@ -174,6 +181,7 @@ MANAGE_ENABLED=true
 MANAGE_HOST=${MANAGE_HOST}
 MANAGE_PORT=${MANAGE_PORT}
 MANAGE_TOKEN=${token}
+SETTINGS_FILE=${settings_file}
 PUPPETEER_EXECUTABLE_PATH=${chrome_path}
 ROUTINEHUB_API_BASE=https://routinehub.co/api/v1/
 CACHE_TTL_MS=60000
