@@ -1833,17 +1833,19 @@ async function testProxy(proxyUrl) {
     });
     const body = await response.text();
 
-    assertNotCloudflareBlocked(body, 'proxy-test', {
-      status: response.status,
-      headers: response.headers,
-    });
-
     if (response.status === 407) {
       throw new Error('Proxy authentication required');
     }
 
     if (response.status >= 500) {
       throw new Error(`Proxy test returned HTTP ${response.status}`);
+    }
+
+    // Only reject on hard Cloudflare blocks (e.g. error 1005/1020, ASN banned).
+    // Manageable challenges (e.g. "Just a moment...") are acceptable here —
+    // the browser + stealth plugin handles those at request time.
+    if (isHardCloudflareBlock(body, { status: response.status, headers: response.headers })) {
+      throw new Error('Proxy IP is hard-blocked by Cloudflare');
     }
 
     return true;
@@ -2002,6 +2004,25 @@ function assertNotCloudflareBlocked(text, source, responseInfo = {}) {
   err.publicDetail =
     'The selected egress IP/proxy was blocked by RoutineHub/Cloudflare. The proxy will rotate on detected block responses until a working proxy is found or the retry limit is reached.';
   throw err;
+}
+
+// Only match definitive, unrecoverable Cloudflare bans (error 1005/1020, ASN banned, etc.).
+// Does NOT match manageable challenges ("Just a moment...") that the browser can solve.
+function isHardCloudflareBlock(text, responseInfo = {}) {
+  const normalized = String(text || '').toLowerCase();
+  const headers = normalizeHeaders(responseInfo.headers);
+  const hasCloudflareText = normalized.includes('cloudflare');
+  const hasKnownBlockText =
+    normalized.includes('error 1005') ||
+    normalized.includes('error 1020') ||
+    (normalized.includes('autonomous system number') &&
+      normalized.includes('banned')) ||
+    (normalized.includes('the owner of this website') &&
+      normalized.includes('has banned')) ||
+    (hasCloudflareText &&
+      (normalized.includes('access denied') ||
+        normalized.includes('you have been blocked')));
+  return hasKnownBlockText;
 }
 
 function isCloudflareBlocked(text, responseInfo = {}) {
