@@ -319,13 +319,6 @@ async function fetchWithBrowser(url) {
       timeout: settings.REQUEST_TIMEOUT_MS,
     });
 
-    await page
-      .waitForNetworkIdle({
-        idleTime: 500,
-        timeout: Math.min(5000, settings.REQUEST_TIMEOUT_MS),
-      })
-      .catch(() => {});
-
     const content = await page.content();
     const bodyContent = await page.evaluate(() =>
       (document.body && document.body.textContent
@@ -1769,7 +1762,8 @@ async function refreshProxyList(force = false) {
     const timeout = setTimeout(() => controller.abort(), settings.REQUEST_TIMEOUT_MS);
 
     try {
-      const response = await fetch(settings.PROXY_LIST_URL, {
+      const listUrl = randomizeProxyListUrl(settings.PROXY_LIST_URL);
+      const response = await fetch(listUrl, {
         headers: {
           Accept: 'text/plain,*/*;q=0.8',
           'User-Agent': settings.USER_AGENT,
@@ -1927,6 +1921,12 @@ function getProxyStatus() {
     testConcurrency: settings.PROXY_TEST_CONCURRENCY,
     testTimeoutMs: settings.PROXY_TEST_TIMEOUT_MS,
   };
+}
+
+function randomizeProxyListUrl(url) {
+  if (!url) return url;
+  const randomTimeout = Math.floor(Math.random() * (330 - 280 + 1)) + 280;
+  return url.replace(/([?&]timeout=)\d+/, `$1${randomTimeout}`);
 }
 
 function normalizeProxyUrl(value) {
