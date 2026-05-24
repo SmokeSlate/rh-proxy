@@ -217,10 +217,15 @@ async function fetchRoutineHub(url) {
             throw err;
           }
 
-          if (settings.AUTO_PROXY_ENABLED && shouldRotateProxy(err)) {
+          // Cloudflare challenge on direct fetch: fall through to browser with
+          // the same proxy rather than rotating — the browser can solve it.
+          if (err.code === 'UPSTREAM_BLOCKED') {
+            console.warn(`Direct fetch got Cloudflare challenge, falling back to browser: ${err.message}`);
+          } else if (settings.AUTO_PROXY_ENABLED && shouldRotateProxy(err)) {
             throw err;
+          } else {
+            console.warn(`Direct fetch failed, falling back to browser: ${err.message}`);
           }
-          console.warn(`Direct fetch failed, falling back to browser: ${err.message}`);
         }
       }
 
