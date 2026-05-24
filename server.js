@@ -370,6 +370,13 @@ async function initBrowser(proxyUrl = '') {
           '--mute-audio',
           '--no-default-browser-check',
           '--no-first-run',
+          '--no-zygote',
+          '--disable-software-rasterizer',
+          '--disable-dev-shm-usage',
+          '--disable-features=VizDisplayCompositor',
+          '--js-flags=--max-old-space-size=64 --optimize-for-size',
+          '--disk-cache-size=1',
+          '--media-cache-size=1',
           ...(browserProxy ? [`--proxy-server=${browserProxy.server}`] : []),
         ],
       })
