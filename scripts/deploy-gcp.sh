@@ -288,7 +288,9 @@ current="\$(git_safe rev-parse HEAD)"
 git_safe fetch --quiet --depth 1 origin "\${BRANCH}"
 latest="\$(git_safe rev-parse "origin/\${BRANCH}")"
 
-if [[ "\${current}" == "\${latest}" ]]; then
+deployed_file="\${APP_DIR}/.git/rh-proxy-deployed"
+deployed="\$(cat "\${deployed_file}" 2>/dev/null || true)"
+if [[ "\${current}" == "\${latest}" && "\${deployed}" == "\${latest}" ]]; then
   exit 0
 fi
 
@@ -298,6 +300,8 @@ chown -R "\${APP_USER}:\${APP_USER}" "\${APP_DIR}"
 sudo -u "\${APP_USER}" env HOME="\${APP_DIR}" npm --prefix "\${APP_DIR}" ci --omit=dev --no-audit --no-fund
 sudo -u "\${APP_USER}" env HOME="\${APP_DIR}" node --check "\${APP_DIR}/server.js"
 systemctl restart "\${APP_NAME}.service"
+printf '%s\n' "\${latest}" >"\${deployed_file}.tmp"
+mv "\${deployed_file}.tmp" "\${deployed_file}"
 logger -t "\${APP_NAME}-update" "Updated to \${latest}"
 EOF_UPDATE
   chmod 0755 /usr/local/bin/${APP_NAME}-update
@@ -376,3 +380,4 @@ EOF_DONE
 }
 
 main "$@"
+

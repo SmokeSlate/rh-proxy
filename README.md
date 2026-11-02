@@ -22,7 +22,7 @@ sudo env \
   bash scripts/deploy-gcp.sh
 ```
 
-The script installs Node.js, Chromium, production npm dependencies, a locked-down `rh-proxy.service`, and a `rh-proxy-update.timer` that pulls GitHub and restarts only when the deployed commit changes.
+The script installs Node.js, Chromium, production npm dependencies, a locked-down `rh-proxy.service`, and a `rh-proxy-update.timer` that pulls GitHub and restarts when the deployed commit changes or a previous installation did not finish successfully. The updater records its last successful restart in `.git/rh-proxy-deployed`; a missing marker causes one full install/check/restart.
 
 Management UI:
 
@@ -43,6 +43,8 @@ curl -X PATCH "http://<instance-ip>:9999/api/settings?token=<token>" \
 If the ports are not reachable externally, open GCP firewall TCP ports `80` and `9999`.
 
 ## Runtime settings
+
+Manual startup disables management unless `MANAGE_TOKEN` is nonempty. Set a token before enabling remote management; no unauthenticated management listener is started.
 
 These environment variables are optional:
 
@@ -103,6 +105,7 @@ If `/health` works but proxy routes show Cloudflare error `1005`, the app is rea
 ```sh
 npm install
 npm run check
+npm test
 npm start
 ```
 
@@ -114,3 +117,6 @@ For full proxy testing with plain `npm start`, set `PUPPETEER_EXECUTABLE_PATH` t
 docker build -t routinehub-proxy .
 docker run --rm -p 80:80 routinehub-proxy
 ```
+
+
+The regression suite uses only Node built-ins, mocked Express/browser/HTTP dependencies, a synthetic DOM, and an updater shell with stubbed Git/install/service commands. It does not bind ports, launch Chromium, install services, or contact upstream servers.

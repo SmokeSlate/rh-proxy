@@ -20,8 +20,9 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PORT = toPort(process.env.PORT, 80);
 const MANAGE_HOST = process.env.MANAGE_HOST || '0.0.0.0';
 const MANAGE_PORT = toPort(process.env.MANAGE_PORT, 9999);
-const MANAGE_ENABLED = process.env.MANAGE_ENABLED !== 'false';
 const MANAGE_TOKEN = process.env.MANAGE_TOKEN || '';
+// Never expose unauthenticated management, even with an explicit public bind.
+const MANAGE_ENABLED = process.env.MANAGE_ENABLED !== 'false' && Boolean(MANAGE_TOKEN);
 const CHROME_PATH =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   process.env.CHROME_BIN ||
@@ -53,6 +54,7 @@ let settings = loadSettings();
 
 let browser;
 let browserPromise;
+let browserGeneration = 0;
 let browserProxyUrl = '';
 let activeBrowserPages = 0;
 const browserQueue = [];
@@ -115,17 +117,16 @@ app.use(async (req, res) => {
   stats.proxyRequests += 1;
   stats.lastProxyRequestAt = new Date();
 
-  const targetUrl = buildTargetUrl(req);
-  const cacheKey = `${req.method}:${targetUrl}`;
-  const cached = getCached(cacheKey);
-
-  if (cached) {
-    stats.cacheHits += 1;
-    sendProxyResponse(res, cached);
-    return;
-  }
-
   try {
+    const targetUrl = buildTargetUrl(req);
+    const cacheKey = `${req.method}:${targetUrl}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      stats.cacheHits += 1;
+      sendProxyResponse(res, cached);
+      return;
+    }
+
     const result = await fetchRoutineHub(targetUrl);
     setCached(cacheKey, result);
     sendProxyResponse(res, result);
@@ -336,6 +337,14 @@ async function fetchWithBrowser(url) {
       headers: response ? response.headers() : {},
     });
 
+    const status = response ? response.status() : 502;
+    if (status < 200 || status >= 300 || !isJson(bodyContent)) {
+      const err = new Error(`Invalid upstream browser response: HTTP ${status}`);
+      err.statusCode = status >= 400 && status <= 599 ? status : 502;
+      err.code = 'UPSTREAM_RESPONSE_INVALID';
+      throw err;
+    }
+
     return {
       bodyContent,
       content,
@@ -356,6 +365,7 @@ async function initBrowser(proxyUrl = '') {
   }
 
   if (!browserPromise) {
+    const generation = browserGeneration;
     const browserProxy = parseBrowserProxy(proxyUrl);
     console.log(
       `Launching Chromium${browserProxy ? ` with proxy ${maskProxyUrl(proxyUrl)}` : ''}...`
@@ -385,18 +395,24 @@ async function initBrowser(proxyUrl = '') {
           ...(browserProxy ? [`--proxy-server=${browserProxy.server}`] : []),
         ],
       })
-      .then((launchedBrowser) => {
+      .then(async (launchedBrowser) => {
+        if (generation !== browserGeneration) {
+          await launchedBrowser.close().catch(() => {});
+          throw new Error('Browser launch invalidated by reset');
+        }
         browser = launchedBrowser;
         browserProxyUrl = proxyUrl;
         browserPromise = null;
         browser.on('disconnected', () => {
-          browser = null;
-          browserProxyUrl = '';
+          if (browser === launchedBrowser) {
+            browser = null;
+            browserProxyUrl = '';
+          }
         });
         return launchedBrowser;
       })
       .catch((err) => {
-        browserPromise = null;
+        if (generation === browserGeneration) browserPromise = null;
         throw err;
       });
   }
@@ -431,6 +447,8 @@ function withBrowserSlot(task) {
 }
 
 async function resetBrowser() {
+  browserGeneration += 1;
+  browserPromise = null;
   if (!browser) {
     return;
   }
@@ -456,17 +474,27 @@ async function shutdown(signal) {
 }
 
 function buildTargetUrl(req) {
-  const [pathPart, queryString] = req.originalUrl.split('?');
-  const cleanPath = pathPart
-    .replace(/^\/api\/v1\/?/, '')
-    .replace(/^\/+/, '');
-  const target = new URL(cleanPath, settings.ROUTINEHUB_API_BASE);
-
-  if (queryString) {
-    target.search = `?${queryString}`;
+  try {
+    const index = req.originalUrl.indexOf('?');
+    const pathPart = index < 0 ? req.originalUrl : req.originalUrl.slice(0, index);
+    const queryString = index < 0 ? '' : req.originalUrl.slice(index);
+    const cleanPath = pathPart.replace(/^\/api\/v1\/?/, '').replace(/^\/+/, '');
+    const base = new URL(settings.ROUTINEHUB_API_BASE);
+    const target = new URL(cleanPath, base);
+    if (target.origin !== base.origin || !target.pathname.startsWith(base.pathname) ||
+        target.username || target.password) {
+      throw new Error('Destination outside configured API');
+    }
+    target.search = queryString;
+    target.hash = '';
+    return target.toString();
+  } catch (_err) {
+    const err = new Error('Invalid API path');
+    err.statusCode = 400;
+    err.code = 'INVALID_API_PATH';
+    err.publicMessage = 'Invalid API path';
+    throw err;
   }
-
-  return target.toString();
 }
 
 function sendProxyResponse(res, result) {
@@ -638,7 +666,7 @@ function getManageAuth(req) {
 }
 
 function isManageAuthorized(token) {
-  return !MANAGE_TOKEN || token === MANAGE_TOKEN;
+  return Boolean(MANAGE_TOKEN) && token === MANAGE_TOKEN;
 }
 
 function getManageStatus() {
@@ -1140,7 +1168,7 @@ function manageScript() {
         ['Heap total MB', status.memory.heapTotalMb],
         ['Cache size', status.cache.size + '/' + status.cache.maxEntries],
       ]);
-      fields.result.textContent = JSON.stringify(status.stats.lastProxyError || { ok: true }, null, 2);
+      // Status refreshes must not overwrite action output or validation errors.
     }
 
     document.getElementById('refresh').addEventListener('click', loadStatus);
@@ -1406,7 +1434,16 @@ async function applySettings(nextSettings) {
 
   if (proxyChanged) {
     resetProxyPool(settings.OUTBOUND_PROXY_URL);
+    const retired = [...fetchDispatchers.values()];
     fetchDispatchers.clear();
+    // close() drains in-flight requests; detach first so new requests get new pools.
+    await Promise.all(retired.map(async (dispatcher) => {
+      try {
+        await dispatcher.close();
+      } catch (err) {
+        await dispatcher.destroy().catch(() => {});
+      }
+    }));
   }
 
   if (proxyChanged || browserChanged) {
@@ -1512,11 +1549,8 @@ function normalizeOptionalProxyUrl(value, key) {
     if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(parsed.protocol)) {
       throw new Error('invalid protocol');
     }
-    if (!parsed.hostname || !parsed.port) {
+    if (!parsed.hostname || (!parsed.port && !['http:', 'https:'].includes(parsed.protocol))) {
       throw new Error('missing host or port');
-    }
-    if (parsed.protocol === 'https:') {
-      parsed.protocol = 'http:';
     }
     return parsed.toString();
   } catch (_err) {
@@ -1957,11 +1991,10 @@ function normalizeProxyUrl(value) {
       return null;
     }
 
-    if (!parsed.hostname || !parsed.port) {
+    if (!parsed.hostname || (!parsed.port && !['http:', 'https:'].includes(parsed.protocol))) {
       return null;
     }
 
-    parsed.protocol = 'http:';
     return parsed.toString();
   } catch (_err) {
     return null;
@@ -2107,3 +2140,4 @@ function maskProxyUrl(proxyUrl) {
 
   return parsed.toString();
 }
+
